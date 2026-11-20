@@ -95,6 +95,7 @@ use language::{
     range_from_lsp, range_to_lsp,
     row_chunk::RowChunk,
 };
+use lsp::type_hierarchy;
 use lsp::{
     AdapterServerCapabilities, CodeActionKind, CompletionContext, DEFAULT_LSP_REQUEST_TIMEOUT,
     DiagnosticServerCapabilities, DiagnosticSeverity, DiagnosticTag,
@@ -4596,6 +4597,19 @@ pub struct FormattableBuffer {
     ranges: Option<Vec<Range<Anchor>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TypeHierarchyDirection {
+    Supertypes,
+    Subtypes,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypeHierarchyItem {
+    pub item: type_hierarchy::Item,
+    pub location: language::Location,
+    server_id: LanguageServerId,
+}
+
 pub struct RemoteLspStore {
     upstream_client: Option<AnyProtoClient>,
     upstream_project_id: u64,
@@ -7660,6 +7674,112 @@ impl LspStore {
                 ))
             })
         }
+    }
+
+    pub fn prepare_type_hierarchy(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        position: PointUtf16,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<TypeHierarchyItem>>> {
+        let Some(local) = self.as_local() else {
+            return Task::ready(Err(anyhow!(
+                "Type hierarchy is available in local projects"
+            )));
+        };
+        let snapshot = buffer.read(cx).snapshot();
+        let scope = snapshot.language_scope_at(position);
+        let server = buffer.update(cx, |buffer, cx| {
+            let opened_servers = local.buffers_opened_in_servers.get(&buffer.remote_id())?;
+            local
+                .language_servers_for_buffer(buffer, cx)
+                .find(|(adapter, server)| {
+                    opened_servers.contains(&server.server_id())
+                        && server.supports_type_hierarchy()
+                        && scope
+                            .as_ref()
+                            .is_none_or(|scope| scope.language_allowed(&adapter.name))
+                })
+                .map(|(_, server)| server.clone())
+        });
+        let file = File::from_dyn(buffer.read(cx).file()).and_then(File::as_local);
+        let Some((server, file)) = server.zip(file) else {
+            return Task::ready(Ok(Vec::new()));
+        };
+        let path = file.abs_path(cx);
+        let timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
+
+        cx.spawn(async move |store, cx| {
+            let params = lsp::TypeHierarchyPrepareParams {
+                text_document_position_params: make_lsp_text_document_position(&path, position)?,
+                work_done_progress_params: Default::default(),
+            };
+            let items = server
+                .request::<type_hierarchy::Prepare>(params, timeout)
+                .await
+                .into_response()
+                .context("Preparing type hierarchy")?;
+            Self::resolve_type_hierarchy_items(items, server.server_id(), store, cx).await
+        })
+    }
+
+    pub fn expand_type_hierarchy(
+        &mut self,
+        item: TypeHierarchyItem,
+        direction: TypeHierarchyDirection,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<TypeHierarchyItem>>> {
+        let server_id = item.server_id;
+        let Some(server) = self.language_server_for_id(server_id) else {
+            return Task::ready(Err(anyhow!("The type hierarchy language server stopped")));
+        };
+        let timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
+        let params = type_hierarchy::FollowupParams { item: item.item };
+
+        cx.spawn(async move |store, cx| {
+            let response = match direction {
+                TypeHierarchyDirection::Supertypes => server
+                    .request::<type_hierarchy::Supertypes>(params, timeout)
+                    .await
+                    .into_response()
+                    .context("Fetching supertypes"),
+                TypeHierarchyDirection::Subtypes => server
+                    .request::<type_hierarchy::Subtypes>(params, timeout)
+                    .await
+                    .into_response()
+                    .context("Fetching subtypes"),
+            }?;
+            Self::resolve_type_hierarchy_items(response, server_id, store, cx).await
+        })
+    }
+
+    async fn resolve_type_hierarchy_items(
+        items: Option<Vec<type_hierarchy::Item>>,
+        server_id: LanguageServerId,
+        store: WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Result<Vec<TypeHierarchyItem>> {
+        let mut resolved = Vec::new();
+        for item in items.unwrap_or_default() {
+            let buffer = store
+                .update(cx, |store, cx| {
+                    store.open_local_buffer_via_lsp(item.uri.clone(), server_id, cx)
+                })?
+                .await?;
+            let range = buffer.read_with(cx, |buffer, _| {
+                anchor_range_from_lsp(item.selection_range, buffer)
+            });
+            resolved.push(TypeHierarchyItem {
+                item,
+                location: language::Location { buffer, range },
+                server_id,
+            });
+        }
+        Ok(resolved)
     }
 
     pub fn prepare_call_hierarchy(

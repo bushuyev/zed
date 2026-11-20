@@ -822,6 +822,15 @@ actions!(
     call_hierarchy,
     [ShowIncomingCalls, ShowOutgoingCalls, ToggleDirection]
 );
+actions!(
+    type_hierarchy,
+    [
+        /// Shows the supertypes of the type under the cursor.
+        ShowSupertypes,
+        /// Shows the subtypes of the type under the cursor.
+        ShowSubtypes,
+    ]
+);
 
 pub mod debug_panel {
     use gpui::actions;

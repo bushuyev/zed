@@ -1,4 +1,5 @@
 mod input_handler;
+pub mod type_hierarchy;
 
 pub use lsp_types::request::*;
 pub use lsp_types::*;
@@ -124,6 +125,7 @@ pub struct LanguageServer {
     process_name: Arc<str>,
     binary: LanguageServerBinary,
     capabilities: RwLock<ServerCapabilities>,
+    supports_type_hierarchy: bool,
     /// Configuration sent to the server, stored for display in the language server logs
     /// buffer. This is represented as the message sent to the LSP in order to avoid cloning it (can
     /// be large in cases like sending schemas to the json server).
@@ -142,6 +144,31 @@ pub struct LanguageServer {
     server: Arc<Mutex<Option<Child>>>,
     workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
     root_uri: Uri,
+}
+
+// The pinned lsp-types models the requests but omits the server capability.
+struct InitializeWithTypeHierarchy;
+
+impl request::Request for InitializeWithTypeHierarchy {
+    type Params = InitializeParams;
+    type Result = InitializeWithTypeHierarchyResult;
+    const METHOD: &'static str = <request::Initialize as request::Request>::METHOD;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitializeWithTypeHierarchyResult {
+    capabilities: TypeHierarchyServerCapabilities,
+    server_info: Option<ServerInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypeHierarchyServerCapabilities {
+    #[serde(flatten)]
+    standard: ServerCapabilities,
+    type_hierarchy_provider: Option<OneOf<bool, TypeHierarchyRegistrationOptions>>,
+    standard_type_hierarchy_provider: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -710,6 +737,7 @@ impl LanguageServer {
                 .unwrap_or_default(),
             binary,
             capabilities: Default::default(),
+            supports_type_hierarchy: false,
             configuration,
             code_action_kinds,
             next_id: Default::default(),
@@ -1102,6 +1130,9 @@ impl LanguageServer {
                     call_hierarchy: Some(CallHierarchyClientCapabilities {
                         dynamic_registration: Some(true),
                     }),
+                    type_hierarchy: Some(TypeHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
                     document_symbol: Some(DocumentSymbolClientCapabilities {
                         hierarchical_document_symbol_support: Some(true),
                         dynamic_registration: Some(true),
@@ -1179,7 +1210,7 @@ impl LanguageServer {
     ) -> Task<Result<Arc<Self>>> {
         cx.background_spawn(async move {
             let response = self
-                .request::<request::Initialize>(params, timeout)
+                .request::<InitializeWithTypeHierarchy>(params, timeout)
                 .await
                 .into_response()
                 .with_context(|| {
@@ -1193,7 +1224,17 @@ impl LanguageServer {
                 self.version = info.version.map(SharedString::from);
                 self.process_name = info.name.into();
             }
-            self.capabilities = RwLock::new(response.capabilities);
+            let capabilities = response.capabilities;
+            self.supports_type_hierarchy = if self.process_name() == "clangd" {
+                // Older clangd releases used typeHierarchyProvider for a different protocol.
+                capabilities.standard_type_hierarchy_provider == Some(true)
+            } else {
+                matches!(
+                    capabilities.type_hierarchy_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            };
+            self.capabilities = RwLock::new(capabilities.standard);
             self.configuration = configuration;
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
@@ -1477,6 +1518,10 @@ impl LanguageServer {
     /// Get the reported capabilities of the running language server.
     pub fn capabilities(&self) -> ServerCapabilities {
         self.capabilities.read().clone()
+    }
+
+    pub fn supports_type_hierarchy(&self) -> bool {
+        self.supports_type_hierarchy
     }
 
     /// Update the capabilities of the running language server.

@@ -2645,6 +2645,7 @@ dependencies = [
 name = "call_hierarchy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "editor",
  "futures 0.3.34",
  "fuzzy",

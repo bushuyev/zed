@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
+use anyhow::Result;
 use editor::{
     Editor, RowHighlightOptions, SelectionEffects,
     scroll::{Autoscroll, ScrollOffset},
@@ -18,7 +19,9 @@ use language::{
     Buffer, CodeLabel, File as _, Language, Location, Rope, ToOffset, ToPoint, lsp_to_symbol_kind,
 };
 use picker::{Picker, PickerDelegate};
-use project::{CallHierarchyItem, LspStoreEvent, Project};
+use project::{
+    CallHierarchyItem, LspStoreEvent, Project, TypeHierarchyDirection, TypeHierarchyItem,
+};
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -26,27 +29,90 @@ use ui::{
 };
 use util::{ResultExt, paths::PathExt};
 use workspace::{DismissDecision, ModalView, Workspace};
-pub use zed_actions::{ShowIncomingCalls, ShowOutgoingCalls, ToggleDirection};
+pub use zed_actions::{
+    ShowIncomingCalls, ShowOutgoingCalls, ShowSubtypes, ShowSupertypes, ToggleDirection,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum CallHierarchyMode {
+enum HierarchyMode {
     #[default]
     Incoming,
     Outgoing,
+    Types(TypeHierarchyDirection),
 }
 
-impl CallHierarchyMode {
+impl HierarchyMode {
     fn opposite(self) -> Self {
         match self {
-            CallHierarchyMode::Incoming => CallHierarchyMode::Outgoing,
-            CallHierarchyMode::Outgoing => CallHierarchyMode::Incoming,
+            Self::Incoming => Self::Outgoing,
+            Self::Outgoing => Self::Incoming,
+            Self::Types(TypeHierarchyDirection::Supertypes) => {
+                Self::Types(TypeHierarchyDirection::Subtypes)
+            }
+            Self::Types(TypeHierarchyDirection::Subtypes) => {
+                Self::Types(TypeHierarchyDirection::Supertypes)
+            }
+        }
+    }
+
+    fn is_type_hierarchy(self) -> bool {
+        matches!(self, Self::Types(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HierarchyItem {
+    Call(CallHierarchyItem),
+    Type(TypeHierarchyItem),
+}
+
+impl HierarchyItem {
+    fn name(&self) -> &str {
+        match self {
+            Self::Call(item) => &item.name,
+            Self::Type(item) => &item.item.name,
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Call(item) => item.detail.as_deref(),
+            Self::Type(item) => item.item.detail.as_deref(),
+        }
+    }
+
+    fn kind(&self) -> language::SymbolKind {
+        lsp_to_symbol_kind(match self {
+            Self::Call(item) => item.kind,
+            Self::Type(item) => item.item.kind,
+        })
+    }
+
+    fn buffer(&self) -> &Entity<Buffer> {
+        match self {
+            Self::Call(item) => &item.buffer,
+            Self::Type(item) => &item.location.buffer,
+        }
+    }
+
+    fn selection_range(&self) -> &Range<language::Anchor> {
+        match self {
+            Self::Call(item) => &item.selection_range,
+            Self::Type(item) => &item.location.range,
+        }
+    }
+
+    fn location(&self) -> Location {
+        Location {
+            buffer: self.buffer().clone(),
+            range: self.selection_range().clone(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Call {
-    pub item: CallHierarchyItem,
+struct Call {
+    item: HierarchyItem,
     pub target: Location,
     pub site_count: usize,
     pub label: Option<Arc<CodeLabel>>,
@@ -81,33 +147,43 @@ impl Settings for CallHierarchySettings {
     }
 }
 
-pub async fn fetch_calls(
-    item: &CallHierarchyItem,
+async fn fetch_calls(
+    item: &HierarchyItem,
     project: &Entity<Project>,
-    mode: CallHierarchyMode,
+    mode: HierarchyMode,
     cx: &mut AsyncWindowContext,
-) -> Vec<Call> {
-    let raw_calls = match mode {
-        CallHierarchyMode::Incoming => {
+) -> Result<Vec<Call>> {
+    let raw_calls = match (item, mode) {
+        (HierarchyItem::Call(item), HierarchyMode::Incoming) => {
             let task = project.update(cx, |project, cx| project.incoming_calls(item.clone(), cx));
             task.await
                 .log_err()
                 .flatten()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|call| (call.from, call.from_ranges))
+                .map(|call| (HierarchyItem::Call(call.from), call.from_ranges))
                 .collect::<Vec<_>>()
         }
-        CallHierarchyMode::Outgoing => {
+        (HierarchyItem::Call(item), HierarchyMode::Outgoing) => {
             let task = project.update(cx, |project, cx| project.outgoing_calls(item.clone(), cx));
             task.await
                 .log_err()
                 .flatten()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|call| (call.to, call.from_ranges))
+                .map(|call| (HierarchyItem::Call(call.to), call.from_ranges))
                 .collect::<Vec<_>>()
         }
+        (HierarchyItem::Type(item), HierarchyMode::Types(direction)) => {
+            let task = project.update(cx, |project, cx| {
+                project.expand_type_hierarchy(item.clone(), direction, cx)
+            });
+            task.await?
+                .into_iter()
+                .map(|item| (HierarchyItem::Type(item), Vec::new()))
+                .collect()
+        }
+        _ => anyhow::bail!("The selected symbol does not match this hierarchy"),
     };
 
     let mut calls = cx
@@ -120,10 +196,7 @@ pub async fn fetch_calls(
                         site.range.start.to_offset(buffer)
                     });
                     let site_count = sites.len().max(1);
-                    let target = sites
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| item_location(&item));
+                    let target = sites.into_iter().next().unwrap_or_else(|| item.location());
                     Call {
                         item,
                         target,
@@ -153,7 +226,7 @@ pub async fn fetch_calls(
         });
     })
     .ok();
-    calls
+    Ok(calls)
 }
 
 pub fn init(cx: &mut App) {
@@ -162,7 +235,7 @@ pub fn init(cx: &mut App) {
 
 pub struct CallHierarchyView {
     picker: Entity<Picker<CallHierarchyDelegate>>,
-    mode: CallHierarchyMode,
+    mode: HierarchyMode,
     _subscriptions: [Subscription; 2],
 }
 
@@ -175,15 +248,45 @@ impl CallHierarchyView {
                     let handle = handle.clone();
                     move |_: &ShowIncomingCalls, window, cx| {
                         if let Some(editor) = handle.upgrade() {
-                            toggle_call_hierarchy(editor, CallHierarchyMode::Incoming, window, cx);
+                            toggle_hierarchy(editor, HierarchyMode::Incoming, window, cx);
                         }
                     }
                 })
                 .detach();
             editor
-                .register_action(move |_: &ShowOutgoingCalls, window, cx| {
+                .register_action({
+                    let handle = handle.clone();
+                    move |_: &ShowOutgoingCalls, window, cx| {
+                        if let Some(editor) = handle.upgrade() {
+                            toggle_hierarchy(editor, HierarchyMode::Outgoing, window, cx);
+                        }
+                    }
+                })
+                .detach();
+            editor
+                .register_action({
+                    let handle = handle.clone();
+                    move |_: &ShowSupertypes, window, cx| {
+                        if let Some(editor) = handle.upgrade() {
+                            toggle_hierarchy(
+                                editor,
+                                HierarchyMode::Types(TypeHierarchyDirection::Supertypes),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                })
+                .detach();
+            editor
+                .register_action(move |_: &ShowSubtypes, window, cx| {
                     if let Some(editor) = handle.upgrade() {
-                        toggle_call_hierarchy(editor, CallHierarchyMode::Outgoing, window, cx);
+                        toggle_hierarchy(
+                            editor,
+                            HierarchyMode::Types(TypeHierarchyDirection::Subtypes),
+                            window,
+                            cx,
+                        );
                     }
                 })
                 .detach();
@@ -194,7 +297,7 @@ impl CallHierarchyView {
         editor: Entity<Editor>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
-        mode: CallHierarchyMode,
+        mode: HierarchyMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> CallHierarchyView {
@@ -283,15 +386,24 @@ impl CallHierarchyView {
         });
     }
 
-    fn set_mode(&mut self, mode: CallHierarchyMode, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: HierarchyMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == mode {
             cx.emit(DismissEvent);
             return;
         }
+        let changed_hierarchy = self.mode.is_type_hierarchy() != mode.is_type_hierarchy();
         self.mode = mode;
         self.picker.update(cx, |picker, cx| {
             picker.delegate.mode = mode;
-            if let Some(root_item) = picker.delegate.root_item.clone() {
+            if changed_hierarchy {
+                picker.delegate.root_item = None;
+                picker.delegate.root_stack.clear();
+                picker.delegate.calls.clear();
+                picker.delegate.matches.clear();
+                picker.delegate.candidates = Arc::default();
+                picker.delegate.selected_index = 0;
+                picker.delegate.fetch_root(window, cx);
+            } else if let Some(root_item) = picker.delegate.root_item.clone() {
                 picker.delegate.load_calls(root_item, None, window, cx);
             }
             picker.set_query("", window, cx);
@@ -327,10 +439,24 @@ impl Render for CallHierarchyView {
         v_flex()
             .key_context("CallHierarchyPicker")
             .on_action(cx.listener(|view, _: &ShowIncomingCalls, window, cx| {
-                view.set_mode(CallHierarchyMode::Incoming, window, cx);
+                view.set_mode(HierarchyMode::Incoming, window, cx);
             }))
             .on_action(cx.listener(|view, _: &ShowOutgoingCalls, window, cx| {
-                view.set_mode(CallHierarchyMode::Outgoing, window, cx);
+                view.set_mode(HierarchyMode::Outgoing, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ShowSupertypes, window, cx| {
+                view.set_mode(
+                    HierarchyMode::Types(TypeHierarchyDirection::Supertypes),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|view, _: &ShowSubtypes, window, cx| {
+                view.set_mode(
+                    HierarchyMode::Types(TypeHierarchyDirection::Subtypes),
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|view, _: &ToggleDirection, window, cx| {
                 view.set_mode(view.mode.opposite(), window, cx);
@@ -344,11 +470,11 @@ pub struct CallHierarchyDelegate {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     editor: Entity<Editor>,
-    mode: CallHierarchyMode,
+    mode: HierarchyMode,
     state: FetchState,
     fetch_task: Option<Task<()>>,
-    root_item: Option<CallHierarchyItem>,
-    root_stack: Vec<CallHierarchyItem>,
+    root_item: Option<HierarchyItem>,
+    root_stack: Vec<HierarchyItem>,
     prev_scroll_position: Option<Point<ScrollOffset>>,
     focus_handle: FocusHandle,
     queried_buffer: Option<Entity<Buffer>>,
@@ -365,7 +491,7 @@ impl CallHierarchyDelegate {
         editor: Entity<Editor>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
-        mode: CallHierarchyMode,
+        mode: HierarchyMode,
         prev_scroll_position: Option<Point<ScrollOffset>>,
         focus_handle: FocusHandle,
     ) -> Self {
@@ -399,6 +525,8 @@ impl CallHierarchyDelegate {
                 .text_anchor_for_position(selection, cx)
         });
         let Some((buffer, position)) = editor_anchor else {
+            self.fetch_task = None;
+            self.queried_buffer = None;
             self.state = FetchState::NoSymbol;
             cx.notify();
             return;
@@ -407,15 +535,34 @@ impl CallHierarchyDelegate {
         self.state = FetchState::Loading;
         cx.notify();
 
-        let prepare_task = self.project.update(cx, |project, cx| {
-            project.prepare_call_hierarchy(&buffer, position, cx)
-        });
-
+        let project = self.project.clone();
+        let mode = self.mode;
         self.fetch_task = Some(cx.spawn_in(window, async move |picker, mut cx| {
-            let root_item = match prepare_task.await {
-                Ok(items) => items.unwrap_or_default().into_iter().next(),
+            let prepared = if mode.is_type_hierarchy() {
+                project
+                    .update(cx, |project, cx| {
+                        project.prepare_type_hierarchy(&buffer, position, cx)
+                    })
+                    .await
+                    .map(|items| items.into_iter().next().map(HierarchyItem::Type))
+            } else {
+                project
+                    .update(cx, |project, cx| {
+                        project.prepare_call_hierarchy(&buffer, position, cx)
+                    })
+                    .await
+                    .map(|items| {
+                        items
+                            .unwrap_or_default()
+                            .into_iter()
+                            .next()
+                            .map(HierarchyItem::Call)
+                    })
+            };
+            let root_item = match prepared {
+                Ok(item) => item,
                 Err(error) => {
-                    log::error!("failed to prepare call hierarchy: {error:#}");
+                    log::error!("failed to prepare hierarchy: {error:#}");
                     picker
                         .update_in(cx, |picker, window, cx| {
                             picker
@@ -450,8 +597,8 @@ impl CallHierarchyDelegate {
 
     fn load_calls(
         &mut self,
-        root_item: CallHierarchyItem,
-        select_item: Option<CallHierarchyItem>,
+        root_item: HierarchyItem,
+        select_item: Option<HierarchyItem>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
@@ -544,14 +691,24 @@ impl PickerDelegate for CallHierarchyDelegate {
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         match (&self.root_item, self.mode) {
-            (Some(root), CallHierarchyMode::Incoming) => {
-                Arc::from(format!("Search calls to `{}`...", root.name))
+            (Some(root), HierarchyMode::Incoming) => {
+                Arc::from(format!("Search calls to `{}`...", root.name()))
             }
-            (Some(root), CallHierarchyMode::Outgoing) => {
-                Arc::from(format!("Search calls from `{}`...", root.name))
+            (Some(root), HierarchyMode::Outgoing) => {
+                Arc::from(format!("Search calls from `{}`...", root.name()))
             }
-            (None, CallHierarchyMode::Incoming) => Arc::from("Search incoming calls..."),
-            (None, CallHierarchyMode::Outgoing) => Arc::from("Search outgoing calls..."),
+            (None, HierarchyMode::Incoming) => Arc::from("Search incoming calls..."),
+            (None, HierarchyMode::Outgoing) => Arc::from("Search outgoing calls..."),
+            (root, HierarchyMode::Types(direction)) => {
+                let label = match direction {
+                    TypeHierarchyDirection::Supertypes => "supertypes",
+                    TypeHierarchyDirection::Subtypes => "subtypes",
+                };
+                match root {
+                    Some(root) => Arc::from(format!("Search {label} of `{}`...", root.name())),
+                    None => Arc::from(format!("Search {label}...")),
+                }
+            }
         }
     }
 
@@ -565,13 +722,24 @@ impl PickerDelegate for CallHierarchyDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(SharedString::new_static(match self.state {
+            FetchState::Loading if self.mode.is_type_hierarchy() => "Fetching type hierarchy…",
             FetchState::Loading => "Fetching call hierarchy…",
+            FetchState::NoSymbol if self.mode.is_type_hierarchy() => {
+                "No type hierarchy for the symbol under the cursor"
+            }
             FetchState::NoSymbol => "No callable symbol under the cursor",
+            FetchState::Failed => "Could not load the hierarchy",
             FetchState::Loaded => {
                 if self.calls.is_empty() {
                     match self.mode {
-                        CallHierarchyMode::Incoming => "No incoming calls found",
-                        CallHierarchyMode::Outgoing => "No outgoing calls found",
+                        HierarchyMode::Incoming => "No incoming calls found",
+                        HierarchyMode::Outgoing => "No outgoing calls found",
+                        HierarchyMode::Types(TypeHierarchyDirection::Supertypes) => {
+                            "No supertypes found"
+                        }
+                        HierarchyMode::Types(TypeHierarchyDirection::Subtypes) => {
+                            "No subtypes found"
+                        }
                     }
                 } else {
                     "No matches"
@@ -700,8 +868,10 @@ impl PickerDelegate for CallHierarchyDelegate {
         }
         let focus_handle = self.focus_handle.clone();
         let expand_label = match self.mode {
-            CallHierarchyMode::Incoming => "Show Callers",
-            CallHierarchyMode::Outgoing => "Show Callees",
+            HierarchyMode::Incoming => "Show Callers",
+            HierarchyMode::Outgoing => "Show Callees",
+            HierarchyMode::Types(TypeHierarchyDirection::Supertypes) => "Show Supertypes",
+            HierarchyMode::Types(TypeHierarchyDirection::Subtypes) => "Show Subtypes",
         };
         Some(
             h_flex()
@@ -862,19 +1032,20 @@ impl Render for CallSignatureTooltip {
 enum FetchState {
     Loading,
     NoSymbol,
+    Failed,
     Loaded,
 }
 
 struct CallHierarchyPreview;
 
-fn toggle_call_hierarchy(
+fn toggle_hierarchy(
     editor: Entity<Editor>,
-    mode: CallHierarchyMode,
+    mode: HierarchyMode,
     window: &mut Window,
     cx: &mut App,
 ) {
     let Some(workspace) = editor.read(cx).workspace() else {
-        log::error!("call hierarchy: editor has no workspace");
+        log::error!("hierarchy picker: editor has no workspace");
         return;
     };
 
@@ -888,19 +1059,12 @@ fn toggle_call_hierarchy(
     });
 }
 
-fn item_location(item: &CallHierarchyItem) -> Location {
-    Location {
-        buffer: item.buffer.clone(),
-        range: item.selection_range.clone(),
-    }
-}
-
 async fn attach_labels(calls: &mut [Call], project: &Entity<Project>, cx: &mut AsyncWindowContext) {
     let mut fallback_groups = Vec::<(Arc<Language>, Vec<usize>)>::new();
     for (index, call) in calls.iter_mut().enumerate() {
         let Some(language) = call
             .item
-            .buffer
+            .buffer()
             .read_with(cx, |buffer, _| buffer.language().cloned())
         else {
             continue;
@@ -933,8 +1097,8 @@ async fn attach_labels(calls: &mut [Call], project: &Entity<Project>, cx: &mut A
         let symbols = indices
             .iter()
             .map(|&index| language::Symbol {
-                name: calls[index].item.name.clone(),
-                kind: lsp_to_symbol_kind(calls[index].item.kind),
+                name: calls[index].item.name().to_owned(),
+                kind: calls[index].item.kind(),
                 container_name: None,
             })
             .collect::<Vec<_>>();
@@ -956,8 +1120,8 @@ async fn attach_labels(calls: &mut [Call], project: &Entity<Project>, cx: &mut A
 
 async fn load_and_apply_calls(
     picker: WeakEntity<Picker<CallHierarchyDelegate>>,
-    root_item: CallHierarchyItem,
-    select_item: Option<CallHierarchyItem>,
+    root_item: HierarchyItem,
+    select_item: Option<HierarchyItem>,
     cx: &mut AsyncWindowContext,
 ) {
     let Ok((project, mode)) = picker.read_with(cx, |picker, _| {
@@ -965,7 +1129,24 @@ async fn load_and_apply_calls(
     }) else {
         return;
     };
-    let mut calls = fetch_calls(&root_item, &project, mode, cx).await;
+    let mut calls = match fetch_calls(&root_item, &project, mode, cx).await {
+        Ok(calls) => calls,
+        Err(error) => {
+            picker
+                .update_in(cx, |picker, window, cx| {
+                    picker.delegate.state = FetchState::Failed;
+                    picker
+                        .delegate
+                        .workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .ok();
+                    picker.refresh_placeholder(window, cx);
+                    cx.notify();
+                })
+                .ok();
+            return;
+        }
+    };
     picker
         .update_in(cx, |picker, window, cx| {
             let row_insets = (DynamicSpacing::Base04.rems(cx).to_pixels(window.rem_size())
@@ -1028,16 +1209,16 @@ async fn load_and_apply_calls(
                     .calls
                     .iter()
                     .enumerate()
-                    .map(|(id, call)| StringMatchCandidate::new(id, &call.item.name))
+                    .map(|(id, call)| StringMatchCandidate::new(id, call.item.name()))
                     .collect(),
             );
             picker.delegate.matches = identity_matches(picker.delegate.calls.len());
             picker.delegate.selected_index = 0;
             let restored_index = select_item.and_then(|target| {
                 picker.delegate.calls.iter().position(|call| {
-                    call.item.buffer == target.buffer
-                        && call.item.selection_range == target.selection_range
-                        && call.item.name == target.name
+                    call.item.buffer() == target.buffer()
+                        && call.item.selection_range() == target.selection_range()
+                        && call.item.name() == target.name()
                 })
             });
             if let Some(restored_index) = restored_index {
@@ -1064,15 +1245,14 @@ fn call_display_path(buffer: &Buffer, cx: &App) -> Option<PathBuf> {
     )
 }
 
-fn signature_label(item: &CallHierarchyItem, language: &Arc<Language>) -> Option<CodeLabel> {
+fn signature_label(item: &HierarchyItem, language: &Arc<Language>) -> Option<CodeLabel> {
     let detail = item
-        .detail
-        .as_deref()
+        .detail()
         .map(str::trim)
         .filter(|detail| !detail.is_empty())?;
     let signature = collapse_whitespace(detail);
-    let name_start = find_symbol_name(&signature, &item.name)?;
-    let filter_range = name_start..name_start + item.name.len();
+    let name_start = find_symbol_name(&signature, item.name())?;
+    let filter_range = name_start..name_start + item.name().len();
     let source = Rope::from_iter([signature.as_str(), " {}"]);
     let runs = language
         .highlight_text(&source, 0..signature.len())
@@ -1162,8 +1342,8 @@ fn compute_call_display(call: &Call, cx: &App) -> CallDisplay {
 
     let detail = extract_call_detail(call).map(SharedString::from);
     let full_signature = SharedString::from(match &detail {
-        Some(detail) => format!("{} {detail}", call.item.name),
-        None => call.item.name.clone(),
+        Some(detail) => format!("{} {detail}", call.item.name()),
+        None => call.item.name().to_owned(),
     });
     let label_text = call
         .label
@@ -1176,7 +1356,7 @@ fn compute_call_display(call: &Call, cx: &App) -> CallDisplay {
     };
 
     CallDisplay {
-        name: SharedString::from(call.item.name.clone()),
+        name: SharedString::from(call.item.name().to_owned()),
         detail,
         path,
         full_signature,
@@ -1191,12 +1371,11 @@ fn extract_call_detail(call: &Call) -> Option<String> {
         Some(detail)
     } else {
         call.item
-            .detail
-            .as_deref()
+            .detail()
             .map(str::trim)
             .filter(|detail| !detail.is_empty())
             .and_then(|detail| {
-                trim_detail_after_symbol_name(detail, &call.item.name)
+                trim_detail_after_symbol_name(detail, call.item.name())
                     .or_else(|| Some(detail.to_owned()))
             })
     };
@@ -1689,6 +1868,210 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_type_hierarchy_multiple_inheritance(cx: &mut TestAppContext) {
+        use lsp::type_hierarchy;
+        use std::sync::atomic::AtomicUsize;
+
+        struct InitializeClangd;
+        impl lsp::request::Request for InitializeClangd {
+            type Params = lsp::InitializeParams;
+            type Result = serde_json::Value;
+            const METHOD: &'static str = "initialize";
+        }
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/test"),
+            json!({
+                "main.cpp": "#include \"bases.hpp\"\nclass Diamond : public Left, public Right {};\nclass Leaf : public Diamond {};\n",
+                "bases.hpp": "#pragma once\nclass Root {};\nclass Left : public Root {};\nclass Right : public Root {};\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+        let mut fake_servers = project.read_with(cx, |project, _| {
+            project.languages().add(Arc::new(Language::new(
+                LanguageConfig {
+                    name: LanguageName::new("C++"),
+                    matcher: Arc::new(LanguageMatcher {
+                        path_suffixes: vec!["cpp".into(), "hpp".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )));
+            project.languages().register_fake_lsp(
+                "C++",
+                FakeLspAdapter {
+                    name: "clangd",
+                    initializer: Some(Box::new(|server| {
+                        server.set_request_handler::<InitializeClangd, _, _>(
+                            |params, _| async move {
+                                assert!(
+                                    params
+                                        .capabilities
+                                        .text_document
+                                        .and_then(|document| document.type_hierarchy)
+                                        .is_some()
+                                );
+                                Ok(json!({
+                                    "capabilities": {
+                                        "textDocumentSync": 1,
+                                        "typeHierarchyProvider": true,
+                                        "standardTypeHierarchyProvider": true,
+                                    },
+                                    "serverInfo": { "name": "clangd" },
+                                }))
+                            },
+                        );
+                    })),
+                    ..Default::default()
+                },
+            )
+        });
+
+        let (workspace, cx) = open_modal_test_workspace(&project, "main.cpp", cx).await;
+        let fake_server = fake_servers.next().await.expect("clangd should start");
+        cx.executor().run_until_parked();
+        let main_uri = lsp::Uri::from_file_path(path!("/test/main.cpp")).expect("main URI");
+        let bases_uri = lsp::Uri::from_file_path(path!("/test/bases.hpp")).expect("header URI");
+        let item = |name: &str, uri: &lsp::Uri, line| type_hierarchy::Item {
+            name: name.to_owned(),
+            kind: lsp::SymbolKind::CLASS,
+            tags: Some(vec![]),
+            detail: None,
+            uri: uri.clone(),
+            range: lsp::Range::new(lsp::Position::new(line, 0), lsp::Position::new(line, 14)),
+            selection_range: lsp::Range::new(
+                lsp::Position::new(line, 6),
+                lsp::Position::new(line, 6 + name.len() as u32),
+            ),
+            data: Some(
+                serde_json::value::to_raw_value(&json!({
+                    "symbol": [name, { "opaque": [true, null, 19] }],
+                }))
+                .expect("opaque data"),
+            ),
+        };
+        let diamond = item("Diamond", &main_uri, 1);
+        let leaf = item("Leaf", &main_uri, 2);
+        let left = item("Left", &bases_uri, 2);
+        let right = item("Right", &bases_uri, 3);
+        let root = item("Root", &bases_uri, 1);
+        let editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("C++ editor should be open");
+        let diamond_position = language::Point::new(1, 6);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([diamond_position..diamond_position]);
+            });
+        });
+
+        fake_server.set_request_handler::<type_hierarchy::Prepare, _, _>({
+            let diamond = diamond.clone();
+            move |params, _| {
+                assert_eq!(
+                    params.text_document_position_params.text_document.uri,
+                    diamond.uri
+                );
+                assert_eq!(
+                    params.text_document_position_params.position,
+                    diamond.selection_range.start
+                );
+                let diamond = diamond.clone();
+                async move { Ok(Some(vec![diamond])) }
+            }
+        });
+        let supertype_requests = Arc::new(AtomicUsize::new(0));
+        fake_server.set_request_handler::<type_hierarchy::Supertypes, _, _>({
+            let diamond = diamond.clone();
+            let supertype_requests = supertype_requests.clone();
+            move |params, _| {
+                supertype_requests.fetch_add(1, Ordering::SeqCst);
+                let (expected, related) = match params.item.name.as_str() {
+                    "Diamond" => (&diamond, vec![left.clone(), right.clone()]),
+                    "Left" => (&left, vec![root.clone()]),
+                    name => panic!("Unexpected supertype request for {name}"),
+                };
+                assert_eq!(
+                    serde_json::to_value(params.item).expect("follow-up item"),
+                    serde_json::to_value(expected).expect("server item")
+                );
+                async move { Ok(Some(related)) }
+            }
+        });
+        fake_server.set_request_handler::<type_hierarchy::Subtypes, _, _>(move |params, _| {
+            assert_eq!(
+                serde_json::to_value(params.item).expect("follow-up item"),
+                serde_json::to_value(&diamond).expect("server item")
+            );
+            let leaf = leaf.clone();
+            async move { Ok(Some(vec![leaf])) }
+        });
+
+        cx.dispatch_action(ShowSupertypes);
+        cx.executor().run_until_parked();
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<CallHierarchyView>(cx)
+            })
+            .expect("type hierarchy should open");
+        let names = |cx: &VisualTestContext| {
+            modal.read_with(cx, |view, cx| {
+                view.picker
+                    .read(cx)
+                    .delegate
+                    .calls
+                    .iter()
+                    .map(|call| call.item.name().to_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(names(cx), ["Left", "Right"]);
+        assert_eq!(supertype_requests.load(Ordering::SeqCst), 1);
+
+        cx.dispatch_action(menu::SelectChild);
+        cx.executor().run_until_parked();
+        assert_eq!(names(cx), ["Root"]);
+        assert_eq!(supertype_requests.load(Ordering::SeqCst), 2);
+
+        cx.dispatch_action(menu::SelectParent);
+        cx.executor().run_until_parked();
+        assert_eq!(names(cx), ["Left", "Right"]);
+
+        cx.dispatch_action(ShowSubtypes);
+        cx.executor().run_until_parked();
+        assert_eq!(names(cx), ["Leaf"]);
+
+        cx.dispatch_action(ShowSupertypes);
+        cx.executor().run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.executor().run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<CallHierarchyView>(cx).is_none());
+            let editor = workspace
+                .active_item_as::<Editor>(cx)
+                .expect("base editor")
+                .read(cx);
+            let selection = editor.selections.newest_anchor().head();
+            let (buffer, anchor) = editor
+                .buffer()
+                .read(cx)
+                .text_anchor_for_position(selection, cx)
+                .expect("class definition anchor");
+            let buffer = buffer.read(cx);
+            assert_eq!(
+                buffer.file().expect("header file").path().as_ref(),
+                rel_path("bases.hpp")
+            );
+            assert_eq!(anchor.to_point(buffer), language::Point::new(2, 6));
+        });
+    }
+
+    #[gpui::test]
     async fn test_call_hierarchy_modal_basic(cx: &mut TestAppContext) {
         init_test(cx);
         let (workspace, fake_server, test_uri, cx) =
@@ -1729,11 +2112,11 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("main")
             );
             assert_eq!(delegate.calls.len(), 1);
-            assert_eq!(delegate.calls[0].item.name, "helper");
+            assert_eq!(delegate.calls[0].item.name(), "helper");
             assert_eq!(delegate.calls[0].site_count, 1);
         });
     }
@@ -1783,9 +2166,9 @@ mod tests {
             .expect("Call hierarchy modal should be open in incoming mode");
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
-            assert_eq!(delegate.mode, CallHierarchyMode::Incoming);
+            assert_eq!(delegate.mode, HierarchyMode::Incoming);
             assert_eq!(delegate.calls.len(), 1);
-            assert_eq!(delegate.calls[0].item.name, "main");
+            assert_eq!(delegate.calls[0].item.name(), "main");
             let target_start = delegate.calls[0]
                 .target
                 .range
@@ -1939,8 +2322,8 @@ mod tests {
             .expect("modal should be open");
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
-            assert_eq!(delegate.mode, CallHierarchyMode::Outgoing);
-            assert_eq!(delegate.calls[0].item.name, "callee");
+            assert_eq!(delegate.mode, HierarchyMode::Outgoing);
+            assert_eq!(delegate.calls[0].item.name(), "callee");
         });
 
         let picker_focused = cx.update(|window, cx| {
@@ -1957,16 +2340,16 @@ mod tests {
             .advance_clock(std::time::Duration::from_millis(200));
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
-            assert_eq!(delegate.mode, CallHierarchyMode::Incoming);
+            assert_eq!(delegate.mode, HierarchyMode::Incoming);
             assert_eq!(
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("helper"),
                 "toggling direction should keep the same root"
             );
-            assert_eq!(delegate.calls[0].item.name, "caller");
+            assert_eq!(delegate.calls[0].item.name(), "caller");
         });
 
         cx.dispatch_action(ShowOutgoingCalls);
@@ -1974,8 +2357,8 @@ mod tests {
             .advance_clock(std::time::Duration::from_millis(200));
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
-            assert_eq!(delegate.mode, CallHierarchyMode::Outgoing);
-            assert_eq!(delegate.calls[0].item.name, "callee");
+            assert_eq!(delegate.mode, HierarchyMode::Outgoing);
+            assert_eq!(delegate.calls[0].item.name(), "callee");
         });
 
         cx.dispatch_action(ShowOutgoingCalls);
@@ -2047,7 +2430,7 @@ mod tests {
                 delegate
                     .calls
                     .iter()
-                    .map(|call| call.item.name.as_str())
+                    .map(|call| call.item.name())
                     .collect::<Vec<_>>(),
                 vec!["alpha", "helper", "zeta"]
             );
@@ -2079,7 +2462,7 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("helper"),
                 "the expand chord should re-root the hierarchy at the selected call"
             );
@@ -2087,11 +2470,11 @@ mod tests {
                 delegate
                     .root_stack
                     .iter()
-                    .map(|item| item.name.as_str())
+                    .map(|item| item.name())
                     .collect::<Vec<_>>(),
                 vec!["main"]
             );
-            assert_eq!(delegate.calls[0].item.name, "leaf");
+            assert_eq!(delegate.calls[0].item.name(), "leaf");
             assert_eq!(view.picker.read(cx).query(cx), "");
         });
 
@@ -2103,7 +2486,7 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("leaf")
             );
             assert_eq!(delegate.state, FetchState::Loaded);
@@ -2122,13 +2505,13 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("helper"),
                 "the back chord should step back up from the empty leaf state"
             );
             assert_eq!(delegate.selected_index, 0);
             assert_eq!(
-                delegate.selected_call().map(|call| call.item.name.as_str()),
+                delegate.selected_call().map(|call| call.item.name()),
                 Some("leaf"),
                 "stepping back should select the item we drilled into"
             );
@@ -2142,7 +2525,7 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("main")
             );
             assert_eq!(delegate.root_stack.len(), 0);
@@ -2151,7 +2534,7 @@ mod tests {
                 "stepping back should reselect the item we drilled into, not the first row"
             );
             assert_eq!(
-                delegate.selected_call().map(|call| call.item.name.as_str()),
+                delegate.selected_call().map(|call| call.item.name()),
                 Some("helper")
             );
         });
@@ -2170,7 +2553,7 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("main"),
                 "a bare arrow must not expand the hierarchy"
             );
@@ -2185,7 +2568,7 @@ mod tests {
                 delegate
                     .root_item
                     .as_ref()
-                    .map(|root_item| root_item.name.as_str()),
+                    .map(|root_item| root_item.name()),
                 Some("helper"),
                 "expanding a filtered selection should drill into it"
             );
@@ -2243,10 +2626,7 @@ mod tests {
                 FetchState::NoSymbol,
                 "prepare against a not-yet-ready server should find nothing"
             );
-            assert_eq!(
-                delegate.root_item.as_ref().map(|item| item.name.as_str()),
-                None
-            );
+            assert_eq!(delegate.root_item.as_ref().map(|item| item.name()), None);
             let buffer = delegate
                 .queried_buffer
                 .clone()
@@ -2271,11 +2651,11 @@ mod tests {
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
             assert_eq!(
-                delegate.root_item.as_ref().map(|item| item.name.as_str()),
+                delegate.root_item.as_ref().map(|item| item.name()),
                 Some("helper"),
                 "buffer registration should retry the preparation"
             );
-            assert_eq!(delegate.calls[0].item.name, "main");
+            assert_eq!(delegate.calls[0].item.name(), "main");
         });
 
         fake_server.set_request_handler::<lsp::request::CallHierarchyIncomingCalls, _, _>({
@@ -2295,7 +2675,8 @@ mod tests {
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
             assert_eq!(
-                delegate.calls[0].item.name, "main",
+                delegate.calls[0].item.name(),
+                "main",
                 "server events after results arrived should not refetch"
             );
         });
@@ -2365,11 +2746,11 @@ mod tests {
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
             assert_eq!(
-                delegate.root_item.as_ref().map(|item| item.name.as_str()),
+                delegate.root_item.as_ref().map(|item| item.name()),
                 Some("helper"),
                 "finished language server work should retry the preparation"
             );
-            assert_eq!(delegate.calls[0].item.name, "main");
+            assert_eq!(delegate.calls[0].item.name(), "main");
         });
     }
 
@@ -2451,7 +2832,7 @@ mod tests {
                 "call sites should be grouped per caller"
             );
             let call = &delegate.calls[0];
-            assert_eq!(call.item.name, "main");
+            assert_eq!(call.item.name(), "main");
             assert_eq!(call.site_count, 3);
             let target_start = call
                 .target
@@ -2585,7 +2966,7 @@ mod tests {
             range: selection_range.clone(),
         };
         Call {
-            item: CallHierarchyItem {
+            item: HierarchyItem::Call(CallHierarchyItem {
                 buffer,
                 server_id: lsp::LanguageServerId(0),
                 name: name.to_string(),
@@ -2594,7 +2975,7 @@ mod tests {
                 range,
                 selection_range,
                 data: None,
-            },
+            }),
             target,
             site_count: 1,
             label: None,
@@ -2657,6 +3038,18 @@ mod tests {
             )
         });
 
+        let (workspace, cx) = open_modal_test_workspace(&project, "src/main.rs", cx).await;
+        let fake_server = fake_servers.next().await.unwrap();
+        cx.executor().run_until_parked();
+        let test_uri = lsp::Uri::from_file_path(path!("/test/src/main.rs")).unwrap();
+        (workspace, fake_server, test_uri, cx)
+    }
+
+    async fn open_modal_test_workspace<'a>(
+        project: &Entity<Project>,
+        path: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace =
@@ -2670,22 +3063,13 @@ mod tests {
 
         workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path(
-                    (worktree_id, rel_path("src/main.rs")),
-                    None,
-                    true,
-                    window,
-                    cx,
-                )
+                workspace.open_path((worktree_id, rel_path(path)), None, true, window, cx)
             })
             .await
             .unwrap()
             .downcast::<Editor>()
             .unwrap();
 
-        let fake_server = fake_servers.next().await.unwrap();
-        cx.executor().run_until_parked();
-        let test_uri = lsp::Uri::from_file_path(path!("/test/src/main.rs")).unwrap();
-        (workspace, fake_server, test_uri, cx)
+        (workspace, cx)
     }
 }

@@ -172,7 +172,7 @@ pub use lsp_store::{
     DiagnosticSummary, InvalidationStrategy, LanguageServerLogType, LanguageServerProgress,
     LanguageServerPromptRequest, LanguageServerShowDocumentRequest, LanguageServerStatus,
     LanguageServerToQuery, LspStore, LspStoreEvent, ProgressToken,
-    SERVER_PROGRESS_THROTTLE_TIMEOUT,
+    SERVER_PROGRESS_THROTTLE_TIMEOUT, TypeHierarchyDirection, TypeHierarchyItem,
 };
 pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
@@ -4587,6 +4587,29 @@ impl Project {
             let result = task.await;
             drop(guard);
             result
+        })
+    }
+
+    pub fn prepare_type_hierarchy<T: ToPointUtf16>(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: T,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<TypeHierarchyItem>>> {
+        let position = position.to_point_utf16(buffer.read(cx));
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.prepare_type_hierarchy(buffer, position, cx)
+        })
+    }
+
+    pub fn expand_type_hierarchy(
+        &self,
+        item: TypeHierarchyItem,
+        direction: TypeHierarchyDirection,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<TypeHierarchyItem>>> {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.expand_type_hierarchy(item, direction, cx)
         })
     }
 

@@ -278,6 +278,8 @@ pub fn deploy_context_menu(
                     "Show Outgoing Calls",
                     Box::new(zed_actions::ShowOutgoingCalls),
                 )
+                .action("Show Supertypes", Box::new(zed_actions::ShowSupertypes))
+                .action("Show Subtypes", Box::new(zed_actions::ShowSubtypes))
                 .separator()
                 .action("Rename Symbol", Box::new(Rename))
                 .action("Format Buffer", Box::new(Format))

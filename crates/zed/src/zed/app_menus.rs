@@ -258,6 +258,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 ),
                 MenuItem::action("Show Incoming Calls", call_hierarchy::ShowIncomingCalls),
                 MenuItem::action("Show Outgoing Calls", call_hierarchy::ShowOutgoingCalls),
+                MenuItem::action("Show Supertypes", call_hierarchy::ShowSupertypes),
+                MenuItem::action("Show Subtypes", call_hierarchy::ShowSubtypes),
                 MenuItem::separator(),
                 MenuItem::action("Next Problem", editor::actions::GoToDiagnostic::default()),
                 MenuItem::action(

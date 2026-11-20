@@ -375,7 +375,7 @@ async fn call_hierarchy_item_from_lsp(
     })
 }
 
-fn anchor_range_from_lsp(range: lsp::Range, buffer: &Buffer) -> Range<Anchor> {
+pub(crate) fn anchor_range_from_lsp(range: lsp::Range, buffer: &Buffer) -> Range<Anchor> {
     let range = range_from_lsp(range);
     let start = buffer.clip_point_utf16(range.start, Bias::Left);
     let end = buffer.clip_point_utf16(range.end, Bias::Left);
