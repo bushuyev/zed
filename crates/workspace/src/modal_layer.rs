@@ -271,6 +271,10 @@ impl ModalLayer {
         active_modal.modal.view().downcast::<V>().ok()
     }
 
+    pub(crate) fn stashed_modal<V: ManagedView + 'static>(&self) -> Option<Entity<V>> {
+        self.stashed_modal.as_ref()?.view().downcast::<V>().ok()
+    }
+
     pub fn has_active_modal(&self) -> bool {
         self.active_modal.is_some()
     }

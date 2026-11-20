@@ -1290,9 +1290,23 @@
     "context": "CallHierarchyPicker > Picker > Editor",
     "use_key_equivalents": true,
     "bindings": {
+      "cmd-shift-enter": "call_hierarchy::OpenHierarchyInResultsTab",
       "cmd-k cmd-h": "call_hierarchy::ToggleDirection",
       "cmd-k right": "menu::SelectChild",
       "cmd-k left": "menu::SelectParent",
+    },
+  },
+  {
+    "context": "HierarchyResults",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "home": "menu::SelectFirst",
+      "end": "menu::SelectLast",
+      "left": "menu::SelectParent",
+      "right": "menu::SelectChild",
+      "enter": "menu::Confirm",
+      "cmd-k cmd-h": "call_hierarchy::ToggleDirection",
     },
   },
   {

@@ -8927,6 +8927,10 @@ impl Workspace {
         self.modal_layer.read(cx).active_modal()
     }
 
+    pub fn stashed_modal<V: ManagedView + 'static>(&self, cx: &App) -> Option<Entity<V>> {
+        self.modal_layer.read(cx).stashed_modal()
+    }
+
     /// Toggles a modal of type `V`. If a modal of the same type is currently active,
     /// it will be hidden. If a different modal is active, it will be replaced with the new one.
     /// If no modal is active, the new modal will be shown.

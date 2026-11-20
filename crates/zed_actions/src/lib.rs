@@ -813,7 +813,17 @@ actions!(
 );
 actions!(
     call_hierarchy,
-    [ShowIncomingCalls, ShowOutgoingCalls, ToggleDirection]
+    [
+        ShowIncomingCalls,
+        ShowOutgoingCalls,
+        ToggleDirection,
+        /// Opens the current call or type hierarchy in a results tab.
+        OpenHierarchyInResultsTab,
+        /// Shows callers of the symbol under the cursor in a results tab.
+        ShowIncomingCallsInResults,
+        /// Shows callees of the symbol under the cursor in a results tab.
+        ShowOutgoingCallsInResults,
+    ]
 );
 actions!(
     type_hierarchy,
@@ -822,6 +832,10 @@ actions!(
         ShowSupertypes,
         /// Shows the subtypes of the type under the cursor.
         ShowSubtypes,
+        /// Shows supertypes of the symbol under the cursor in a results tab.
+        ShowSupertypesInResults,
+        /// Shows subtypes of the symbol under the cursor in a results tab.
+        ShowSubtypesInResults,
     ]
 );
 

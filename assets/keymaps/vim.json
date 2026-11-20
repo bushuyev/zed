@@ -1243,6 +1243,17 @@
     },
   },
   {
+    "context": "HierarchyResults",
+    "bindings": {
+      "h": "menu::SelectParent",
+      "j": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "l": "menu::SelectChild",
+      "g g": "menu::SelectFirst",
+      "shift-g": "menu::SelectLast",
+    },
+  },
+  {
     "context": "FileHistoryView",
     "bindings": {
       "j": "menu::SelectNext",

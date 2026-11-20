@@ -57,6 +57,25 @@ Both actions are also available in the editor's right-click menu.
 The modal's width can be changed via the `call_hierarchy.modal_max_width` setting.
 This requires the language server to support call hierarchy.
 
+## Type Hierarchy
+
+With the cursor on a type, {#action type_hierarchy::ShowSupertypes} lists its base types and {#action type_hierarchy::ShowSubtypes} lists its derived types. The picker uses the same controls as Call Hierarchy. Type Hierarchy is available in local projects with a language server that supports the standard requests, such as clangd.
+
+## Hierarchy Results {#hierarchy-results}
+
+Choose {#action call_hierarchy::OpenHierarchyInResultsTab} from either picker’s footer or the command palette, or press {#kb call_hierarchy::OpenHierarchyInResultsTab}. The tab retains the picker’s loaded results, selection, and path in the current direction. If the path includes steps in the opposite direction, the tree starts after those steps.
+
+To skip the picker, run one of these commands from the [command palette](./command-palette.md):
+
+- {#action call_hierarchy::ShowIncomingCallsInResults}
+- {#action call_hierarchy::ShowOutgoingCallsInResults}
+- {#action type_hierarchy::ShowSupertypesInResults}
+- {#action type_hierarchy::ShowSubtypesInResults}
+
+Use the up and down arrows to select a row. The right arrow expands it or moves to its first child. The left arrow collapses it or moves to its parent. In Vim mode, you can also use `j`, `k`, `l`, and `h`. Press Enter or double-click to open the definition or the individual call site in a separate pane. Expand a call to see its call sites alongside related symbols.
+
+The direction button switches between callers and callees or between supertypes and subtypes. Each direction remembers its expanded branches and selection. Zed fetches branches when you expand them and reuses the results when you reopen them. You can move or split hierarchy tabs like other tabs. They stay open while you edit and navigate during the current session.
+
 ## Outline Panel
 
 The Outline Panel ({#kb outline_panel::ToggleFocus}) shows a persistent tree view of symbols in the current file. It's especially useful with [multibuffers](./multibuffers.md) for navigating search results or diagnostics.
