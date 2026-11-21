@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Exercise Change Signature against rebuilt servers, then compile the edited fixtures."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+
+
+COMMAND = "refactor.changeSignature"
+CAPABILITIES = {
+    "general": {"positionEncodings": ["utf-16"]},
+    "textDocument": {"codeAction": {
+        "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["refactor.rewrite"]}}
+    }},
+    "workspace": {"workspaceEdit": {"documentChanges": True}},
+    "experimental": {
+        "interactiveResolve": {
+            "inputTypes": ["string"],
+            "workspaceEditPreview": True,
+        }
+    },
+}
+
+
+class ResponseError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.code = message["code"]
+
+
+class Client:
+    def __init__(self, arguments, root):
+        self.process = subprocess.Popen(
+            arguments, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        self.request_id = 0
+        self.root = root
+        result = self.request("initialize", {
+            "processId": os.getpid(),
+            "rootUri": root.as_uri(),
+            "capabilities": CAPABILITIES,
+            "initializationOptions": {"checkOnSave": False},
+        })
+        provider = result["capabilities"]["experimental"]["interactiveResolveProvider"]
+        assert "command" in provider["kinds"], result
+        assert COMMAND in provider["previewCommands"], result
+        self.send("initialized", {})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, *_):
+        try:
+            if error_type is None:
+                self.request("shutdown", None)
+                self.send("exit", None)
+                self.process.wait(timeout=5)
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
+                self.process.wait()
+
+    def packet(self, message):
+        body = json.dumps({"jsonrpc": "2.0", **message}).encode()
+        self.process.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        self.process.stdin.flush()
+
+    def send(self, method, params):
+        self.packet({"method": method, "params": params})
+
+    def request(self, method, params):
+        self.request_id += 1
+        self.packet({"id": self.request_id, "method": method, "params": params})
+        while True:
+            headers = {}
+            while line := self.process.stdout.readline().strip():
+                name, value = line.split(b":", 1)
+                headers[name.lower()] = value.strip()
+            assert b"content-length" in headers, f"server closed during {method}"
+            message = json.loads(self.process.stdout.read(int(headers[b"content-length"])))
+            if "method" in message:
+                if "id" in message:
+                    if message["method"] == "workspace/configuration":
+                        result = [None] * len(message["params"]["items"])
+                    elif message["method"] == "workspace/workspaceFolders":
+                        result = [{"uri": self.root.as_uri(), "name": "fixture"}]
+                    elif message["method"] == "workspace/applyEdit":
+                        raise AssertionError("server tried to edit files before confirmation")
+                    else:
+                        result = None
+                    self.packet({"id": message["id"], "result": result})
+            elif message.get("id") == self.request_id:
+                if "error" in message:
+                    raise ResponseError(message["error"])
+                return message.get("result")
+
+    def open(self, path, language):
+        self.send("textDocument/didOpen", {
+            "textDocument": {"uri": path.as_uri(), "languageId": language,
+                             "version": 1, "text": path.read_text()},
+        })
+
+    def command(self, path, symbol):
+        lines = path.read_text().splitlines()
+        line, character = next((index, line.index(symbol)) for index, line in enumerate(lines) if symbol in line)
+        position = {"line": line, "character": character}
+        deadline = time.monotonic() + 25
+        while True:
+            try:
+                actions = self.request("textDocument/codeAction", {
+                    "textDocument": {"uri": path.as_uri()},
+                    "range": {"start": position, "end": position},
+                    "context": {"diagnostics": [], "only": ["refactor.rewrite"]},
+                })
+            except ResponseError as error:
+                if error.code not in (-32800, -32801):
+                    raise
+                actions = []
+            for action in actions or []:
+                command = action.get("command", {})
+                if command.get("command") == COMMAND:
+                    return {"command": COMMAND, "arguments": command["arguments"]}
+            assert time.monotonic() < deadline, (path, symbol, actions)
+            time.sleep(0.2)
+
+    def signature(self, path, symbol):
+        deadline = time.monotonic() + 25
+        while True:
+            command = self.request("command/resolve", self.command(path, symbol))
+            if command.get("formFields"):
+                break
+            assert time.monotonic() < deadline, command
+            time.sleep(0.2)
+        fields = command.pop("formFields")
+        assert len(fields) == 1 and fields[0]["id"] == "signature", fields
+        return command, json.loads(fields[0]["default"])
+
+    def refactor(self, command, signature, should_fail=None):
+        command["formAnswers"] = [{"id": "signature", "value": json.dumps(signature)}]
+        resolved = self.request("command/resolve", command)
+        if should_fail:
+            assert should_fail in resolved["formFields"][0]["error"], resolved
+            return
+        assert not resolved.get("formFields"), resolved
+        return self.request("workspace/executeCommand", resolved)
+
+
+def apply(root, preview):
+    edit = preview["edit"]
+    documents = edit.get("changes")
+    if documents is None:
+        documents = {entry["textDocument"]["uri"]: entry["edits"]
+                     for entry in edit.get("documentChanges", [])}
+    assert documents, preview
+    files = {file.as_uri(): file for file in root.rglob("*") if file.is_file()}
+    for uri, edits in documents.items():
+        path = files[uri]
+        text = path.read_text()
+        assert preview["originals"][uri] == text, path
+        lines = text.splitlines(keepends=True)
+
+        def offset(pos):
+            line = pos["line"]
+            prefix = lines[line].encode("utf-16-le")[:2 * pos["character"]]
+            return sum(map(len, lines[:line])) + len(prefix.decode("utf-16-le"))
+
+        offsets = [(offset(entry["range"]["start"]), offset(entry["range"]["end"]), entry["newText"])
+                   for entry in edits]
+        for start, end, replacement in sorted(offsets, reverse=True):
+            text = text[:start] + replacement + text[end:]
+        path.write_text(text)
+    return len(documents)
+
+
+def compile_cpp(root):
+    subprocess.run(["clang++", "-std=c++17", *[str(file) for file in root.glob("*.cpp")],
+                    "-o", str(root / "fixture")], check=True)
+    subprocess.run([str(root / "fixture")], check=True)
+
+
+def run_cpp(binary, root):
+    header = root / "api.h"
+    header.write_text("int calculate(int x, int y);\nint calculate(int x);\n")
+    definition = root / "definition.cpp"
+    definition.write_text('#include "api.h"\nint calculate(int x, int y) { return x-y; }\n'
+                          'int calculate(int x) { return x; }\n')
+    caller = root / "caller.cpp"
+    caller.write_text('#include "api.h"\nint main() { return calculate(10, 3) == 7 && calculate(2) == 2 ? 0 : 1; }\n')
+    (root / "compile_commands.json").write_text(json.dumps([
+        {"directory": str(root), "file": str(path),
+         "arguments": ["clang++", "-std=c++17", "-c", str(path)]}
+        for path in [definition, caller]
+    ]))
+    with Client([binary, "--background-index", "--log=error"], root) as client:
+        client.open(definition, "cpp")
+        client.open(caller, "cpp")
+        client.request("sync", None)
+        command, signature = client.signature(definition, "calculate(")
+        signature["parameters"].reverse()
+        signature["parameters"].append({
+            "oldIndex": None, "name": "normalize", "type": "bool", "argument": "false"
+        })
+        result = client.refactor(command, signature)
+        assert "bool normalize" not in definition.read_text()
+        assert apply(root, result) == 3
+    assert "calculate(3, 10, false)" in caller.read_text()
+    assert "int calculate(int x)" in definition.read_text()
+    compile_cpp(root)
+    print("C++ declaration, definition, remote caller, reorder, addition, and overload isolation")
+
+
+def run_virtual_cpp(binary, root):
+    path = root / "main.cpp"
+    path.write_text(
+        "struct Base { virtual int process(int x, int y) { return x-y; } };\n"
+        "struct Derived : Base { int process(int x, int y) override { return 2*(x-y); } };\n"
+        "int main() { Derived d; Base &b=d; return b.process(10, 3) == 14 ? 0 : 1; }\n"
+    )
+    with Client([binary, "--log=error"], root) as client:
+        client.open(path, "cpp")
+        command, signature = client.signature(path, "process(")
+        signature["parameters"].reverse()
+        assert apply(root, client.refactor(command, signature)) == 1
+    assert path.read_text().count("process(int y, int x)") == 2
+    compile_cpp(root)
+    print("C++ virtual override and dispatch")
+
+
+def run_cpp_validation(binary, root):
+    path = root / "main.cpp"
+    path.write_text(
+        "int calculate(int value, int unused = 0) { return value; }\n"
+        "int main() { return calculate(7) == 7 ? 0 : 1; }\n"
+    )
+    with Client([binary, "--log=error"], root) as client:
+        client.open(path, "cpp")
+        command, signature = client.signature(path, "calculate(")
+        signature["parameters"].pop()
+        signature["parameters"][0].update(name="result", type="const char *")
+        client.refactor(command, signature, should_fail="does not compile")
+        signature["parameters"][0]["type"] = "long"
+        signature["returnType"] = "long"
+        assert apply(root, client.refactor(command, signature)) == 1
+    assert "long calculate(long result) { return result; }" in path.read_text()
+    assert "calculate(7)" in path.read_text()
+    compile_cpp(root)
+
+    path.write_text(
+        "int calculate(int first, int second) { return first - second; }\n"
+        "int main() { int x=10; return calculate(x++, x); }\n"
+    )
+    with Client([binary, "--log=error"], root) as client:
+        client.open(path, "cpp")
+        command, signature = client.signature(path, "calculate(")
+        signature["parameters"].reverse()
+        client.refactor(command, signature, should_fail="side effects")
+    print("C++ parameter removal, rename, types, omitted defaults, and unsafe inputs")
+
+
+def run_rust(binary, root):
+    (root / "Cargo.toml").write_text('[package]\nname = "signature_fixture"\nversion = "0.1.0"\nedition = "2024"\n')
+    source = root / "src"
+    source.mkdir()
+    main = source / "main.rs"
+    main.write_text("mod implementation;\nuse implementation::{Processor, Impl, Other};\n"
+                    "fn main() { let receiver = Impl; let direct = receiver.process(10, 3); "
+                    "let qualified = Impl::process(&receiver, 10, 3); "
+                    "let other = Other.process(10, 3); "
+                    "assert_eq!(direct, 7); assert_eq!(qualified, 7); assert_eq!(other, 14); }\n")
+    implementation = source / "implementation.rs"
+    implementation.write_text("pub trait Processor { fn process(&self, x: i32, y: i32) -> i32; }\n"
+                              "pub struct Impl;\n"
+                              "impl Processor for Impl { fn process(&self, a: i32, b: i32) -> i32 { a-b } }\n"
+                              "pub struct Other;\n"
+                              "impl Processor for Other { fn process(&self, a: i32, b: i32) -> i32 { 2*(a-b) } }\n")
+    with Client([binary], root) as client:
+        client.open(implementation, "rust")
+        client.open(main, "rust")
+        command, signature = client.signature(implementation, "process(")
+        signature["parameters"].reverse()
+        signature["parameters"].append({
+            "oldIndex": None, "name": "_normalize", "type": "bool", "argument": "false"
+        })
+        result = client.refactor(command, signature)
+        assert "_normalize" not in implementation.read_text()
+        assert apply(root, result) == 2
+    assert "receiver.process(3, 10, false)" in main.read_text()
+    assert "Impl::process(&receiver, 3, 10, false)" in main.read_text()
+    assert "Other.process(3, 10, false)" in main.read_text()
+    subprocess.run(["cargo", "+1.98.1", "run", "--quiet", "--offline"], cwd=root, check=True)
+    print("Rust trait, implementation, method syntax, explicit receiver, cross-file calls, and compilation")
+
+
+def run_rust_function(binary, root):
+    (root / "Cargo.toml").write_text('[package]\nname = "signature_fixture"\nversion = "0.1.0"\nedition = "2024"\n')
+    source = root / "src"
+    source.mkdir()
+    path = source / "main.rs"
+    path.write_text(
+        "fn calculate(x: i32, y: i32, unused: bool) -> i32 { x - y }\n"
+        'fn main() { println!("{}", calculate(10, 3, false)); }\n'
+    )
+    with Client([binary], root) as client:
+        client.open(path, "rust")
+        command, signature = client.signature(path, "calculate(")
+        signature["parameters"].pop()
+        signature["parameters"].reverse()
+        for parameter in signature["parameters"]:
+            parameter["type"] = "i64"
+        signature["parameters"][1]["name"] = "value"
+        signature["returnType"] = "i64"
+        assert apply(root, client.refactor(command, signature)) == 1
+    assert "calculate(y: i64, value: i64) -> i64 { value - y }" in path.read_text()
+    assert "calculate(3, 10)" in path.read_text()
+    output = subprocess.check_output(["cargo", "+1.98.1", "run", "--quiet", "--offline"], cwd=root, text=True)
+    assert output.strip() == "7", output
+    print("Rust free function, reorder, parameter removal, rename, type change, and behavior")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--clangd", type=Path)
+    parser.add_argument("--rust-analyzer", type=Path)
+    args = parser.parse_args()
+    if not args.clangd and not args.rust_analyzer:
+        parser.error("provide at least one modified server binary")
+    for binary, test in [(args.clangd, run_cpp), (args.clangd, run_virtual_cpp),
+                         (args.clangd, run_cpp_validation), (args.rust_analyzer, run_rust),
+                         (args.rust_analyzer, run_rust_function)]:
+        if binary:
+            with tempfile.TemporaryDirectory(prefix="change-signature-") as directory:
+                test(str(binary.resolve(strict=True)), Path(directory))
+
+
+if __name__ == "__main__":
+    main()
