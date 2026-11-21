@@ -72,6 +72,7 @@ mod diagnostics;
 mod edit_prediction;
 mod input;
 mod interactive_refactor;
+pub use interactive_refactor::RefactorPreviewToolbar;
 mod markdown_actions;
 mod navigation;
 mod rewrap;

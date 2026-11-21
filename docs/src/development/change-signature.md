@@ -12,7 +12,9 @@ Change Signature updates a function or method and its resolved references in the
 1. Place the cursor on a function name in a declaration or direct call.
 2. Run {#action editor::ChangeSignature} from the command palette, or choose **Change Signature** from the code-action menu.
 3. Edit the ordered `parameters` list in the signature form. Keep an existing parameter's `oldIndex` when moving or editing it. Delete an entry to remove that parameter. Set `oldIndex` to `null` for a new parameter and provide an `argument` expression for existing calls.
-4. Choose **Continue** to review the unified diff and server warnings. Use **Apply** to update the affected buffers, then save them. Press Escape or choose **Cancel** in either dialog to leave the source unchanged.
+4. Choose **Continue** to open the preview tab. Review the file diffs and server warnings, then choose **Apply** in the top-right toolbar. Choose **Cancel** or close the preview tab to discard it.
+
+The form includes a read-only JSON example. With a compatible clangd, **Force** opens a preview even when the proposed C++ edits produce compiler errors. The preview shows the compiler diagnostic and requires explicit confirmation. Reference resolution and buffer validation still apply.
 
 The first version uses an editable JSON form. For example, moving the second parameter before the first and adding a Boolean parameter in C++ looks like this:
 
@@ -84,9 +86,9 @@ script/test-change-signature \
 
 The client follows the [gopls interactive refactoring protocol](https://go.googlesource.com/tools/+/refs/heads/master/gopls/doc/design/integrating-interactive-refactoring.md) for capability discovery and form resolution. It advertises `experimental.interactiveResolve.inputTypes`. A compatible server advertises `experimental.interactiveResolveProvider.kinds` with `"command"`. A `refactor.rewrite` code action provides the `refactor.changeSignature` command. Zed sends `command/resolve`, collects answers and displays validation errors, then sends `workspace/executeCommand` when no fields remain.
 
-The preview extension adds `workspaceEditPreview: true` to the client's interactive capability and lists previewable commands under the server's `interactiveResolveProvider.previewCommands`. For those commands, execution returns `{ edit, originals, warnings }`. The `edit` is a standard LSP `WorkspaceEdit`. The `originals` object maps each edited URI to the source text the server used to calculate its edits. The server never sends `workspace/applyEdit` for Change Signature. The signature itself is a standard string field named `signature`, with JSON carrying the ordered parameter identities and optional return type. A Rust function without an explicit return type uses `null`.
+The preview extension adds `workspaceEditPreview: true` to the client's interactive capability and lists previewable commands under the server's `interactiveResolveProvider.previewCommands`. For those commands, execution returns `{ edit, originals, warnings }`. The `edit` is a standard LSP `WorkspaceEdit`. The `originals` object maps each edited URI to the source text the server used to calculate its edits. The server never sends `workspace/applyEdit` for Change Signature. A server can advertise commands that accept `force: true` in `command/resolve` via `interactiveResolveProvider.forcePreviewCommands`. The signature itself is a standard string field named `signature`, with JSON carrying the ordered parameter identities and optional return type. A Rust function without an explicit return type uses `null`.
 
-Zed resolves UTF-16 ranges against the actual buffers, shows their unified diff, and checks every staged buffer again before editing any of them. Successful changes use Zed's project transaction path for multi-file undo. The editor workflow is in `crates/editor/src/interactive_refactor.rs` and the protocol types are in `crates/lsp/src/interactive_refactor.rs`.
+Zed resolves UTF-16 ranges against the actual buffers, shows the changes in a read-only diff tab, and checks every staged buffer again before editing any of them. Successful changes use Zed's project transaction path for multi-file undo. The editor workflow is in `crates/editor/src/interactive_refactor.rs` and the protocol types are in `crates/lsp/src/interactive_refactor.rs`.
 
 ## Language server behavior
 

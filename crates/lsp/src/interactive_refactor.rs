@@ -18,6 +18,8 @@ pub struct InteractiveCommand {
     pub form_fields: Vec<Field>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub form_answers: Vec<Answer>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
 }
 
 impl From<&Command> for InteractiveCommand {
@@ -27,6 +29,7 @@ impl From<&Command> for InteractiveCommand {
             arguments: command.arguments.clone().unwrap_or_default(),
             form_fields: Vec::new(),
             form_answers: Vec::new(),
+            force: false,
         }
     }
 }
@@ -99,6 +102,11 @@ pub fn supports_resolution(capabilities: &ServerCapabilities) -> bool {
 
 pub fn supports_preview(capabilities: &ServerCapabilities, command: &str) -> bool {
     supports_resolution(capabilities) && advertises(capabilities, "previewCommands", command)
+}
+
+pub fn supports_force_preview(capabilities: &ServerCapabilities, command: &str) -> bool {
+    supports_preview(capabilities, command)
+        && advertises(capabilities, "forcePreviewCommands", command)
 }
 
 fn advertises(capabilities: &ServerCapabilities, property: &str, value: &str) -> bool {

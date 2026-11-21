@@ -1515,6 +1515,8 @@ fn initialize_pane(
             toolbar.add_item(highlights_tree_item, window, cx);
             let project_diff_toolbar = cx.new(|cx| ProjectDiffToolbar::new(workspace, cx));
             toolbar.add_item(project_diff_toolbar, window, cx);
+            let refactor_preview_toolbar = cx.new(|_| editor::RefactorPreviewToolbar::default());
+            toolbar.add_item(refactor_preview_toolbar, window, cx);
             let staged_diff_toolbar = cx.new(|cx| StagedDiffToolbar::new(workspace, cx));
             toolbar.add_item(staged_diff_toolbar, window, cx);
             let unstaged_diff_toolbar = cx.new(|cx| UnstagedDiffToolbar::new(workspace, cx));

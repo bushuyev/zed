@@ -18,6 +18,7 @@ CAPABILITIES = {
     }},
     "workspace": {"workspaceEdit": {"documentChanges": True}},
     "experimental": {
+        "serverStatusNotification": True,
         "interactiveResolve": {
             "inputTypes": ["string"],
             "workspaceEditPreview": True,
@@ -39,6 +40,7 @@ class Client:
         )
         self.request_id = 0
         self.root = root
+        self.quiescent = False
         result = self.request("initialize", {
             "processId": os.getpid(),
             "rootUri": root.as_uri(),
@@ -83,6 +85,8 @@ class Client:
             assert b"content-length" in headers, f"server closed during {method}"
             message = json.loads(self.process.stdout.read(int(headers[b"content-length"])))
             if "method" in message:
+                if message["method"] == "experimental/serverStatus":
+                    self.quiescent = message["params"]["quiescent"]
                 if "id" in message:
                     if message["method"] == "workspace/configuration":
                         result = [None] * len(message["params"]["items"])
@@ -103,6 +107,20 @@ class Client:
             "textDocument": {"uri": path.as_uri(), "languageId": language,
                              "version": 1, "text": path.read_text()},
         })
+
+    def wait_for_rust_project(self, path):
+        deadline = time.monotonic() + 30
+        while not self.quiescent:
+            try:
+                self.request("textDocument/hover", {
+                    "textDocument": {"uri": path.as_uri()},
+                    "position": {"line": 0, "character": 0},
+                })
+            except ResponseError as error:
+                if error.code not in (-32800, -32801):
+                    raise
+            assert time.monotonic() < deadline, "rust-analyzer did not finish loading the project"
+            time.sleep(0.2)
 
     def command(self, path, symbol):
         lines = path.read_text().splitlines()
@@ -139,8 +157,11 @@ class Client:
         assert len(fields) == 1 and fields[0]["id"] == "signature", fields
         return command, json.loads(fields[0]["default"])
 
-    def refactor(self, command, signature, should_fail=None):
+    def refactor(self, command, signature, should_fail=None, *, force=False):
+        command = dict(command)
         command["formAnswers"] = [{"id": "signature", "value": json.dumps(signature)}]
+        if force:
+            command["force"] = True
         resolved = self.request("command/resolve", command)
         if should_fail:
             assert should_fail in resolved["formFields"][0]["error"], resolved
@@ -241,6 +262,11 @@ def run_cpp_validation(binary, root):
         signature["parameters"].pop()
         signature["parameters"][0].update(name="result", type="const char *")
         client.refactor(command, signature, should_fail="does not compile")
+        forced = client.refactor(command, signature, force=True)
+        assert any("does not compile" in warning for warning in forced["warnings"])
+        assert any("const char *" in edit["newText"] and "result" in edit["newText"]
+                   for edit in forced["edit"]["changes"][path.as_uri()])
+        assert "const char *" not in path.read_text()
         signature["parameters"][0]["type"] = "long"
         signature["returnType"] = "long"
         assert apply(root, client.refactor(command, signature)) == 1
@@ -257,6 +283,7 @@ def run_cpp_validation(binary, root):
         command, signature = client.signature(path, "calculate(")
         signature["parameters"].reverse()
         client.refactor(command, signature, should_fail="side effects")
+        client.refactor(command, signature, should_fail="side effects", force=True)
     print("C++ parameter removal, rename, types, omitted defaults, and unsafe inputs")
 
 
@@ -278,6 +305,7 @@ def run_rust(binary, root):
                               "impl Processor for Other { fn process(&self, a: i32, b: i32) -> i32 { 2*(a-b) } }\n")
     with Client([binary], root) as client:
         client.open(implementation, "rust")
+        client.wait_for_rust_project(implementation)
         command, signature = client.signature(implementation, "process(")
         signature["parameters"].reverse()
         signature["parameters"].append({
@@ -304,6 +332,7 @@ def run_rust_function(binary, root):
     )
     with Client([binary], root) as client:
         client.open(path, "rust")
+        client.wait_for_rust_project(path)
         command, signature = client.signature(path, "calculate(")
         signature["parameters"].pop()
         signature["parameters"].reverse()

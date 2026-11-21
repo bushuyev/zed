@@ -7,9 +7,13 @@ use lsp::{
     interactive_refactor::{self, Answer, Field, FieldKind, InteractiveCommand, PreviewEdit},
 };
 use serde_json::Value;
+use ui::Divider;
 
 use super::*;
-use workspace::{DismissDecision, ModalView};
+use workspace::{
+    DismissDecision, Item, ModalView, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
+    item::ItemEvent,
+};
 
 impl Editor {
     pub(crate) fn change_signature_available(&self, cx: &App) -> bool {
@@ -165,6 +169,11 @@ async fn run_command(
         preview || original_command.command != interactive_refactor::CHANGE_SIGNATURE,
         "The language server does not support previewing Change Signature"
     );
+    let signature_form = original_command.command == interactive_refactor::CHANGE_SIGNATURE;
+    let force_available = interactive_refactor::supports_force_preview(
+        &server.capabilities(),
+        &original_command.command,
+    );
     let version = source.read_with(cx, |buffer, _| buffer.version());
     let mut command = InteractiveCommand::from(original_command);
     let mut answers = HashMap::<String, Value>::new();
@@ -193,6 +202,7 @@ async fn run_command(
         }
         let mut field_ids = HashSet::new();
         let mut collected = Vec::with_capacity(command.form_fields.len());
+        command.force = false;
         for field in std::mem::take(&mut command.form_fields) {
             anyhow::ensure!(
                 field_ids.insert(field.id.clone()),
@@ -202,9 +212,21 @@ async fn run_command(
                 .get(&field.id)
                 .cloned()
                 .unwrap_or_else(|| field.default.clone());
-            let Some(answer) = show_form(workspace, &title, field, current, cx).await? else {
+            let Some(submission) = show_form(
+                workspace,
+                &title,
+                field,
+                current,
+                signature_form,
+                force_available,
+                cx,
+            )
+            .await?
+            else {
                 return Ok(());
             };
+            command.force |= submission.force;
+            let answer = submission.answer;
             answers.insert(answer.id.clone(), answer.value.clone());
             if !answer.value.is_null() {
                 collected.push(answer);
@@ -231,7 +253,7 @@ async fn run_command(
     if staged.files.is_empty() {
         return Ok(());
     }
-    let confirmed = show_preview(workspace, &title, staged.diff, cx).await?;
+    let confirmed = show_preview(workspace, &title, &staged, cx).await?;
     if confirmed {
         let transaction = cx.update(|_, cx| {
             anyhow::ensure!(
@@ -247,7 +269,8 @@ async fn run_command(
 
 struct StagedPreview {
     files: Vec<StagedFile>,
-    diff: String,
+    multibuffer: Entity<MultiBuffer>,
+    warnings: Vec<String>,
 }
 
 struct StagedFile {
@@ -285,10 +308,11 @@ async fn stage_preview(
         (None, None) => {}
         (Some(_), Some(_)) => anyhow::bail!("The language server returned ambiguous edit formats"),
     }
-    let mut diff = warnings.join("\n");
-    if !diff.is_empty() {
-        diff.push_str("\n\n");
-    }
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+        multibuffer.set_all_diff_hunks_expanded(cx);
+        multibuffer
+    });
     let mut changes = changes.into_iter().collect::<Vec<_>>();
     changes.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
     let mut files = Vec::new();
@@ -328,10 +352,7 @@ async fn stage_preview(
             modified.replace_range(range.clone(), replacement);
         }
         if modified != original {
-            use std::fmt::Write as _;
-            writeln!(diff, "--- {}\n+++ {}", path.display(), path.display())?;
-            diff.push_str(&language::unified_diff(&original, &modified));
-            diff.push('\n');
+            add_preview_diff(&multibuffer, &buffer, original, modified, cx).await;
             files.push(StagedFile {
                 buffer,
                 version,
@@ -339,7 +360,72 @@ async fn stage_preview(
             });
         }
     }
-    Ok(StagedPreview { files, diff })
+    Ok(StagedPreview {
+        files,
+        multibuffer,
+        warnings,
+    })
+}
+
+async fn add_preview_diff(
+    multibuffer: &Entity<MultiBuffer>,
+    source: &Entity<Buffer>,
+    original: String,
+    modified: String,
+    cx: &mut AsyncWindowContext,
+) {
+    let (path, file, language) = source.read_with(cx, |source_buffer, cx| {
+        (
+            PathKey::for_buffer(source, cx),
+            source_buffer.file().cloned(),
+            source_buffer.language().cloned(),
+        )
+    });
+    let base = cx.new(|cx| {
+        let mut buffer = Buffer::local(original, cx);
+        buffer.set_capability(Capability::ReadOnly, cx);
+        buffer.set_language_async(language.clone(), cx);
+        buffer
+    });
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::build(
+            text::Buffer::new(
+                ReplicaId::LOCAL,
+                cx.entity_id().as_non_zero_u64().into(),
+                modified,
+            ),
+            file,
+            Capability::ReadOnly,
+            cx,
+        );
+        buffer.set_language_async(language, cx);
+        buffer
+    });
+    let base_snapshot = base.read_with(cx, |buffer, _| buffer.snapshot());
+    let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+    let diff =
+        cx.new(|cx| buffer_diff::BufferDiff::new_with_base_text_buffer(&buffer_snapshot, base, cx));
+    let update = diff.read_with(cx, |diff, cx| {
+        diff.update_diff(
+            buffer_snapshot,
+            &base_snapshot,
+            Some(base_snapshot.text().into()),
+            cx,
+        )
+    });
+    let update = update.await;
+    let ranges = diff.update(cx, |diff, cx| {
+        diff.set_snapshot(update, cx);
+        let snapshot = buffer.read(cx).snapshot();
+        diff.snapshot(cx)
+            .hunks(&snapshot)
+            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+            .collect::<Vec<_>>()
+    });
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(path, buffer, ranges, multibuffer_context_lines(cx), cx);
+        multibuffer.add_diff(diff, cx);
+    });
 }
 
 fn insert_document_edit(
@@ -415,13 +501,20 @@ fn apply_preview(files: Vec<StagedFile>, cx: &mut App) -> Result<ProjectTransact
     Ok(transaction)
 }
 
+struct FormSubmission {
+    answer: Answer,
+    force: bool,
+}
+
 async fn show_form(
     workspace: &WeakEntity<Workspace>,
     title: &str,
     field: Field,
     initial_value: Value,
+    signature_form: bool,
+    force_available: bool,
     cx: &mut AsyncWindowContext,
-) -> Result<Option<Answer>> {
+) -> Result<Option<FormSubmission>> {
     anyhow::ensure!(
         !matches!(field.kind, FieldKind::Unsupported),
         "This refactoring requires a form field Zed does not support"
@@ -450,6 +543,21 @@ async fn show_form(
                     title,
                     field,
                     input,
+                    help: signature_form.then(|| {
+                        cx.new(|cx| {
+                            let mut editor = Editor::multi_line(window, cx);
+                            editor.set_use_modal_editing(false);
+                            editor.set_soft_wrap_mode(
+                                language::language_settings::SoftWrap::EditorWidth,
+                                cx,
+                            );
+                            editor.set_text(SIGNATURE_EXAMPLE, window, cx);
+                            editor.move_to_beginning(&MoveToBeginning, window, cx);
+                            editor.set_read_only(true);
+                            editor
+                        })
+                    }),
+                    force_available,
                     response: Some(response),
                     error: None,
                 }
@@ -459,24 +567,43 @@ async fn show_form(
     Ok(answer.await.ok())
 }
 
+const SIGNATURE_EXAMPLE: &str = r#"{
+  "name": "calculate",
+  "parameters": [
+    { "oldIndex": 1, "name": "second", "type": "int" },
+    { "oldIndex": 0, "name": "first", "type": "int" },
+    { "oldIndex": null, "name": "new_param", "type": "int", "argument": "0" }
+  ],
+  "returnType": "void"
+}"#;
+
 struct RefactorForm {
     title: SharedString,
     field: Field,
     input: Entity<Editor>,
-    response: Option<oneshot::Sender<Answer>>,
+    help: Option<Entity<Editor>>,
+    force_available: bool,
+    response: Option<oneshot::Sender<FormSubmission>>,
     error: Option<SharedString>,
 }
 
 impl RefactorForm {
     fn submit(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        self.submit_with_force(false, cx);
+    }
+
+    fn submit_with_force(&mut self, force: bool, cx: &mut Context<Self>) {
         match parse_answer(&self.field, self.input.read(cx).text(cx)) {
             Ok(value) => {
                 if let Some(response) = self.response.take() {
                     // The editor task may have already been closed.
                     response
-                        .send(Answer {
-                            id: self.field.id.clone(),
-                            value,
+                        .send(FormSubmission {
+                            answer: Answer {
+                                id: self.field.id.clone(),
+                                value,
+                            },
+                            force,
                         })
                         .ok();
                 }
@@ -528,7 +655,12 @@ impl ModalView for RefactorForm {
     }
 }
 impl Render for RefactorForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input_height = if self.help.is_some() {
+            (window.viewport_size().height * 0.3).min(rems(16.).to_pixels(window.rem_size()))
+        } else {
+            rems(17.).to_pixels(window.rem_size())
+        };
         let options = match &self.field.kind {
             FieldKind::Enum { entries } => Some(
                 entries
@@ -562,7 +694,7 @@ impl Render for RefactorForm {
                     .or_else(|| self.field.error.clone().map(Into::into))
                     .map(|error| Label::new(error).color(Color::Error)),
             )
-            .child(div().h(rems(17.)).child(self.input.clone()))
+            .child(div().h(input_height).child(self.input.clone()))
             .child(
                 h_flex()
                     .gap_2()
@@ -571,48 +703,64 @@ impl Render for RefactorForm {
                         Button::new("cancel", "Cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
+                    .when(self.force_available, |buttons| {
+                        buttons.child(Button::new("force", "Force")
+                            .tooltip(Tooltip::text("Preview even if the proposed signature fails to compile"))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_with_force(true, cx))))
+                    })
                     .child(Button::new("continue", "Continue").on_click(
                         cx.listener(|this, _, window, cx| this.submit(&menu::Confirm, window, cx)),
                     )),
             )
+            .when_some(self.help.clone(), |form, help| {
+                form.child(Divider::horizontal())
+                    .child(Label::new("Signature JSON").size(LabelSize::Small))
+                    .child(Label::new(
+                        "Keep the function name. Move or remove entries to reorder or delete parameters. Keep the zero-based oldIndex of each existing parameter. Use null and an argument expression for a new parameter. In Rust, use a null returnType to omit it."
+                    ).size(LabelSize::Small).color(Color::Muted))
+                    .child(div().h(input_height).child(help))
+            })
     }
 }
 
 async fn show_preview(
     workspace: &WeakEntity<Workspace>,
     title: &str,
-    diff: String,
+    staged: &StagedPreview,
     cx: &mut AsyncWindowContext,
 ) -> Result<bool> {
     let (response, confirm) = oneshot::channel();
     let title = format!("{title} Preview").into();
-    cx.update(|window, cx| {
-        workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::multi_line(window, cx);
-                    editor.set_use_modal_editing(false);
-                    editor
-                        .set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
-                    editor.set_text(diff, window, cx);
-                    editor.move_to_beginning(&MoveToBeginning, window, cx);
-                    editor.set_read_only(true);
-                    editor
-                });
-                RefactorPreview {
-                    editor,
-                    title,
-                    response: Some(response),
-                }
-            })
-        })
-    })??;
+    workspace.update_in(cx, |workspace, window, cx| {
+        let preview = cx.new(|cx| {
+            let editor = cx.new(|cx| {
+                let mut editor =
+                    Editor::for_multibuffer(staged.multibuffer.clone(), None, window, cx);
+                editor.set_use_modal_editing(false);
+                editor.set_read_only(true);
+                editor
+            });
+            RefactorPreview {
+                editor,
+                title,
+                warnings: staged
+                    .warnings
+                    .iter()
+                    .cloned()
+                    .map(SharedString::from)
+                    .collect(),
+                response: Some(response),
+            }
+        });
+        workspace.add_item_to_active_pane(Box::new(preview), None, true, window, cx);
+    })?;
     Ok(confirm.await.is_ok())
 }
 
 struct RefactorPreview {
     editor: Entity<Editor>,
     title: SharedString,
+    warnings: Vec<SharedString>,
     response: Option<oneshot::Sender<()>>,
 }
 
@@ -621,7 +769,12 @@ impl RefactorPreview {
         if let Some(response) = self.response.take() {
             response.send(()).ok();
         }
-        cx.emit(DismissEvent);
+        cx.emit(ItemEvent::CloseItem);
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.response.take();
+        cx.emit(ItemEvent::CloseItem);
     }
 }
 
@@ -630,43 +783,87 @@ impl Focusable for RefactorPreview {
         self.editor.focus_handle(cx)
     }
 }
-impl EventEmitter<DismissEvent> for RefactorPreview {}
-impl ModalView for RefactorPreview {
-    fn on_before_dismiss(&mut self, _: &mut Window, _: &mut Context<Self>) -> DismissDecision {
-        self.response.take();
-        DismissDecision::Dismiss(true)
+
+impl EventEmitter<ItemEvent> for RefactorPreview {}
+
+impl Item for RefactorPreview {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn to_item_events(event: &ItemEvent, emit: &mut dyn FnMut(ItemEvent)) {
+        emit(*event);
     }
 }
+
 impl Render for RefactorPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            .size_full()
             .key_context("RefactorPreview")
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.confirm(cx)))
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .bg(cx.theme().colors().elevated_surface_background)
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .rounded_lg()
-            .shadow_lg()
-            .w(rems(70.))
-            .max_w_full()
-            .p_4()
-            .gap_2()
-            .child(Label::new(self.title.clone()).size(LabelSize::Large))
-            .child(div().h(rems(25.)).child(self.editor.clone()))
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
+            .when(!self.warnings.is_empty(), |view| {
+                view.child(v_flex().px_3().py_2().gap_1().children(
+                    self.warnings.iter().cloned().map(|warning| {
+                        Label::new(warning)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning)
+                    }),
+                ))
+            })
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Button::new("cancel", "Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        Button::new("apply", "Apply")
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
-                    ),
+                div()
+                    .size_full()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(self.editor.clone()),
             )
+    }
+}
+
+#[derive(Default)]
+pub struct RefactorPreviewToolbar {
+    preview: Option<WeakEntity<RefactorPreview>>,
+}
+
+impl EventEmitter<ToolbarItemEvent> for RefactorPreviewToolbar {}
+
+impl ToolbarItemView for RefactorPreviewToolbar {
+    fn set_active_pane_item(
+        &mut self,
+        item: Option<&dyn ItemHandle>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        self.preview = item
+            .and_then(|item| item.act_as::<RefactorPreview>(cx))
+            .map(|preview| preview.downgrade());
+        if self.preview.is_some() {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+}
+
+impl Render for RefactorPreviewToolbar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let preview = self.preview.clone();
+        h_flex().gap_1p5().when_some(preview, |toolbar, preview| {
+            toolbar
+                .child(Button::new("cancel", "Cancel").on_click({
+                    let preview = preview.clone();
+                    move |_, _, cx| {
+                        preview.update(cx, RefactorPreview::cancel).ok();
+                    }
+                }))
+                .child(Button::new("apply", "Apply").on_click(move |_, _, cx| {
+                    preview.update(cx, RefactorPreview::confirm).ok();
+                }))
+        })
     }
 }
 
@@ -699,6 +896,7 @@ mod tests {
                 "interactiveResolveProvider": {
                     "kinds": ["command"],
                     "previewCommands": [interactive_refactor::CHANGE_SIGNATURE],
+                    "forcePreviewCommands": [interactive_refactor::CHANGE_SIGNATURE],
                 }
             })),
             ..Default::default()
@@ -729,10 +927,11 @@ mod tests {
         test.lsp
             .set_request_handler::<interactive_refactor::ResolveCommand, _, _>(
                 |mut command, _| async move {
-                    if command
-                        .form_answers
-                        .first()
-                        .is_none_or(|answer| answer.value != "reorder")
+                    if !command.force
+                        || command
+                            .form_answers
+                            .first()
+                            .is_none_or(|answer| answer.value != "reorder")
                     {
                         command.form_fields = vec![Field {
                             id: "signature".into(),
@@ -752,6 +951,7 @@ mod tests {
                 let executions = executions.clone();
                 let uri = test.buffer_lsp_url.clone();
                 move |command, _| {
+                    assert!(command.force);
                     assert_eq!(command.form_answers[0].value, "reorder");
                     executions.fetch_add(1, Ordering::SeqCst);
                     let uri = uri.clone();
@@ -809,23 +1009,31 @@ mod tests {
             .expect("validation form");
         form.update_in(&mut test.cx.cx, |form, window, cx| {
             assert_eq!(form.field.error.as_deref(), Some("Try again"));
+            assert!(form.force_available);
+            let help = form.help.as_ref().expect("JSON example").read(cx);
+            assert!(help.read_only(cx));
+            assert!(help.text(cx).contains("\"argument\": \"0\""));
             form.input
                 .update(cx, |input, cx| input.set_text("reorder", window, cx));
-            form.submit(&menu::Confirm, window, cx);
+            form.submit_with_force(true, cx);
         });
         test.cx.executor().run_until_parked();
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert_eq!(editor.read_with(&test.cx.cx, Editor::text), before);
         let preview = test
-            .update_workspace(|workspace, _, cx| workspace.active_modal::<RefactorPreview>(cx))
+            .update_workspace(|workspace, _, cx| workspace.item_of_type::<RefactorPreview>(cx))
             .expect("signature preview");
         preview.read_with(&test.cx.cx, |preview, cx| {
             let diff = preview.editor.read(cx).text(cx);
             assert!(diff.contains("calculate(3, 10)"));
+            assert!(preview.editor.read(cx).read_only(cx));
         });
         preview.update(&mut test.cx.cx, |preview, cx| preview.confirm(cx));
         test.cx.executor().run_until_parked();
         assert_eq!(editor.read_with(&test.cx.cx, Editor::text), after);
+        assert!(test.update_workspace(|workspace, _, cx| {
+            workspace.item_of_type::<RefactorPreview>(cx).is_none()
+        }));
     }
 
     #[gpui::test]
