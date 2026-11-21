@@ -675,7 +675,9 @@ pub(crate) fn render_buffer_header(
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
     let file = buffer.file();
-    let can_open_excerpts = file.is_none_or(|file| file.can_open());
+    let can_open_excerpts = (editor_read.workspace().is_some()
+        || editor_read.delegate_open_excerpts)
+        && file.is_none_or(|file| file.can_open());
     let path_style = file.map(|file| file.path_style(cx));
     let relative_path = buffer.resolve_file_path(include_root, cx);
     let (parent_path, filename) = match (&relative_path, path_style) {

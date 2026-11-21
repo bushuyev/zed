@@ -743,6 +743,7 @@ async fn show_preview(
             RefactorPreview {
                 editor,
                 title,
+                file_count: staged.files.len(),
                 warnings: staged
                     .warnings
                     .iter()
@@ -760,6 +761,7 @@ async fn show_preview(
 struct RefactorPreview {
     editor: Entity<Editor>,
     title: SharedString,
+    file_count: usize,
     warnings: Vec<SharedString>,
     response: Option<oneshot::Sender<()>>,
 }
@@ -796,6 +798,25 @@ impl Item for RefactorPreview {
     fn to_item_events(event: &ItemEvent, emit: &mut dyn FnMut(ItemEvent)) {
         emit(*event);
     }
+
+    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::PrimaryLeft
+    }
+
+    fn breadcrumbs(&self, _: &App) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
+        let text = if self.file_count == 1 {
+            "1 file".into()
+        } else {
+            format!("{} files", self.file_count).into()
+        };
+        Some((
+            vec![HighlightedText {
+                text,
+                highlights: Vec::new(),
+            }],
+            None,
+        ))
+    }
 }
 
 impl Render for RefactorPreview {
@@ -806,13 +827,21 @@ impl Render for RefactorPreview {
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.confirm(cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
             .when(!self.warnings.is_empty(), |view| {
-                view.child(v_flex().px_3().py_2().gap_1().children(
-                    self.warnings.iter().cloned().map(|warning| {
-                        Label::new(warning)
-                            .size(LabelSize::Small)
-                            .color(Color::Warning)
-                    }),
-                ))
+                view.child(
+                    v_flex()
+                        .id("refactor-preview-warnings")
+                        .max_h(rems(8.))
+                        .overflow_y_scroll()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .children(self.warnings.iter().cloned().map(|warning| {
+                            Label::new(warning)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning)
+                        })),
+                )
             })
             .child(
                 div()
