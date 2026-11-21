@@ -771,6 +771,8 @@ actions!(
         RedoSelection,
         /// Renames the symbol at cursor.
         Rename,
+        /// Changes a function signature and previews edits to its callers.
+        ChangeSignature,
         /// Restarts the language server for the current file.
         RestartLanguageServer,
         /// Reverses the order of selected lines.

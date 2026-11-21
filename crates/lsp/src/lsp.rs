@@ -1,4 +1,5 @@
 mod input_handler;
+pub mod interactive_refactor;
 pub mod type_hierarchy;
 
 pub use lsp_types::request::*;
@@ -1172,6 +1173,10 @@ impl LanguageServer {
                 experimental: Some(json!({
                     "serverStatusNotification": true,
                     "localDocs": true,
+                    "interactiveResolve": {
+                        "inputTypes": ["string", "bool", "number", "enum"],
+                        "workspaceEditPreview": true,
+                    },
                 })),
                 window: Some(WindowClientCapabilities {
                     work_done_progress: Some(true),
@@ -2658,6 +2663,15 @@ mod tests {
         server.set_workspace_folders(BTreeSet::from_iter([project_uri.clone()]));
 
         let params = cx.update(|cx| server.default_initialize_params(false, false, cx));
+
+        assert_eq!(
+            params
+                .capabilities
+                .experimental
+                .as_ref()
+                .and_then(|value| { value.pointer("/interactiveResolve/workspaceEditPreview") }),
+            Some(&serde_json::Value::Bool(true))
+        );
 
         assert_eq!(
             params

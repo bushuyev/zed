@@ -668,6 +668,9 @@ impl EditorElement {
         register_action(editor, window, Editor::go_to_prev_reference);
         register_action(editor, window, Editor::go_to_next_reference);
         register_action(editor, window, Editor::go_to_previous_symbol);
+        if editor.read(cx).change_signature_available(cx) {
+            register_action(editor, window, Editor::change_signature);
+        }
         register_action(editor, window, Editor::go_to_next_symbol);
         register_action(editor, window, Editor::restart_language_server);
         register_action(editor, window, Editor::stop_language_server);

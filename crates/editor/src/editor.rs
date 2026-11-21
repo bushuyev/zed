@@ -71,6 +71,7 @@ mod cursor_animation;
 mod diagnostics;
 mod edit_prediction;
 mod input;
+mod interactive_refactor;
 mod markdown_actions;
 mod navigation;
 mod rewrap;

@@ -1254,6 +1254,20 @@
     },
   },
   {
+    "context": "InteractiveRefactor > Editor",
+    "bindings": {
+      "ctrl-enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
+    "context": "RefactorPreview > Editor",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "HierarchyResults",
     "bindings": {
       "up": "menu::SelectPrevious",

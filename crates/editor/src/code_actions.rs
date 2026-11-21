@@ -261,6 +261,20 @@ impl Editor {
                     return Some(Task::ready(Ok(())));
                 }
 
+                if let Some(project) = self.project().cloned()
+                    && let Some(server) =
+                        interactive_refactor::interactive_server(project.read(cx), &action, cx)
+                {
+                    let action = action.clone();
+                    let workspace = workspace.downgrade();
+                    return Some(cx.spawn_in(window, async move |editor, cx| {
+                        interactive_refactor::run(
+                            &editor, workspace, project, buffer, &action, server, cx,
+                        )
+                        .await
+                    }));
+                }
+
                 let apply_code_action =
                     provider.apply_code_action(buffer, action, true, window, cx);
                 let workspace = workspace.downgrade();

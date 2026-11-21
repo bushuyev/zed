@@ -197,7 +197,6 @@ def run_cpp(binary, root):
     ]))
     with Client([binary, "--background-index", "--log=error"], root) as client:
         client.open(definition, "cpp")
-        client.open(caller, "cpp")
         client.request("sync", None)
         command, signature = client.signature(definition, "calculate(")
         signature["parameters"].reverse()
@@ -279,7 +278,6 @@ def run_rust(binary, root):
                               "impl Processor for Other { fn process(&self, a: i32, b: i32) -> i32 { 2*(a-b) } }\n")
     with Client([binary], root) as client:
         client.open(implementation, "rust")
-        client.open(main, "rust")
         command, signature = client.signature(implementation, "process(")
         signature["parameters"].reverse()
         signature["parameters"].append({
