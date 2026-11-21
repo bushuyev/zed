@@ -785,17 +785,17 @@ mod tests {
         assert!(editor.read_with(&test.cx.cx, |editor, cx| {
             editor.change_signature_available(cx)
         }));
-        test.cx.cx.dispatch_action(test.cx.window, ChangeSignature);
+        test.cx.cx.dispatch_action(ChangeSignature);
         test.cx.executor().run_until_parked();
         assert!(test.update_workspace(|workspace, _, cx| {
             workspace.active_modal::<RefactorForm>(cx).is_some()
         }));
-        test.cx.cx.dispatch_action(test.cx.window, menu::Cancel);
+        test.cx.cx.dispatch_action(menu::Cancel);
         test.cx.executor().run_until_parked();
         assert_eq!(executions.load(Ordering::SeqCst), 0);
         assert_eq!(editor.read_with(&test.cx.cx, Editor::text), before);
 
-        test.cx.cx.dispatch_action(test.cx.window, ChangeSignature);
+        test.cx.cx.dispatch_action(ChangeSignature);
         test.cx.executor().run_until_parked();
         let form = test
             .update_workspace(|workspace, _, cx| workspace.active_modal::<RefactorForm>(cx))
